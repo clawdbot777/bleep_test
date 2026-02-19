@@ -57,7 +57,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Job state tracker  {job_id: 'pending'|'running'|'completed'|'failed'}
+_job_status_lock = threading.Lock()
 job_status: dict[str, str] = {}
+
+
+def _set_job_status(job_id: str, status: str) -> None:
+    with _job_status_lock:
+        job_status[job_id] = status
+
+
+def _get_job_status(job_id: str) -> str:
+    with _job_status_lock:
+        return job_status.get(job_id, "unknown")
 
 UPLOAD_FOLDER    = "/tmp/uploads"
 TEMP_FOLDER      = "/tmp/uploads/tmp"
@@ -138,9 +149,13 @@ def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def _hwaccel_flags() -> list[str]:
-    """Return ffmpeg hardware-acceleration flags when CUDA is available."""
-    if CUDA_AVAILABLE:
+def _hwaccel_flags(video: bool = True) -> list[str]:
+    """Return ffmpeg hardware-acceleration flags when CUDA is available.
+
+    Only use for commands that process video.  Audio-only commands should
+    pass ``video=False`` (or simply omit hwaccel flags).
+    """
+    if CUDA_AVAILABLE and video:
         return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
     return []
 
@@ -314,7 +329,7 @@ def normalize_audio_stream(job_id: str, force: bool = False) -> str | None:
 
     cmd = (
         ["ffmpeg", "-y"]
-        + _hwaccel_flags()
+        + _hwaccel_flags(video=False)
         + [
             "-i", input_path,
             "-map", f"0:a:{index_nr}",
@@ -360,7 +375,7 @@ def _extract_center_channel(input_path: str, codec: str, bit_rate: int,
 
     cmd = (
         ["ffmpeg", "-y"]
-        + _hwaccel_flags()
+        + _hwaccel_flags(video=False)
         + ["-i", input_path,
            "-filter_complex", "[0:a]pan=mono|c0=FC[center]",
            "-map", "[center]"]
@@ -443,7 +458,7 @@ def extract_audio_stream(job_id: str) -> dict:
         dts_path = os.path.join(UPLOAD_FOLDER, dts_file)
         cmd = (
             ["ffmpeg", "-y"]
-            + _hwaccel_flags()
+            + _hwaccel_flags(video=False)
             + ["-i", source_path,
                "-map", f"0:a:{stream_index}",
                "-c:a", "dca",
@@ -467,7 +482,7 @@ def extract_audio_stream(job_id: str) -> dict:
     audio_path = os.path.join(UPLOAD_FOLDER, audio_file)
     cmd = (
         ["ffmpeg", "-y"]
-        + _hwaccel_flags()
+        + _hwaccel_flags(video=False)
         + ["-i", source_path,
            "-map", f"0:a:{stream_index}",
            "-c:a", "copy",
@@ -675,7 +690,7 @@ def apply_complex_filter_to_audio(center_path: str, filter_complex: str,
 
     cmd = (
         ["ffmpeg", "-y"]
-        + _hwaccel_flags()
+        + _hwaccel_flags(video=False)
         + ["-i", center_path,
            "-filter_complex", filter_complex,
            "-bitexact", "-ac", "1",
@@ -693,21 +708,55 @@ def apply_complex_filter_to_audio(center_path: str, filter_complex: str,
 def normalize_center_audio(modified_file: str, bitrate=None, sample_rate=None,
                             codec: str | None = None,
                             loudness_info: float | None = None) -> str:
+    """
+    Two-pass loudness normalization of the redacted center channel.
+
+    Pass 1: measure actual loudness of the redacted file.
+    Pass 2: apply loudnorm with measured values for accurate normalization.
+    """
     modified_path = os.path.join(UPLOAD_FOLDER, modified_file)
     base, ext      = os.path.splitext(os.path.basename(modified_file))
     norm_out_file  = f"{base}_normalized{ext}"
     norm_out_path  = os.path.join(UPLOAD_FOLDER, norm_out_file)
 
-    measured_i = loudness_info if loudness_info is not None else -24.0
+    # Pass 1: measure the redacted file's actual loudness
+    measure_cmd = [
+        "ffmpeg", "-y",
+        "-i", modified_path,
+        "-filter:a", "loudnorm=print_format=json",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(measure_cmd, capture_output=True, text=True)
+    output = result.stderr or result.stdout
+    j_start = output.find("{")
+    j_end   = output.rfind("}") + 1
+
+    if j_start != -1 and j_end > j_start:
+        measured = json.loads(output[j_start:j_end])
+        measured_i     = float(measured.get("input_i", -24.0))
+        measured_lra   = float(measured.get("input_lra", 7.0))
+        measured_tp    = float(measured.get("input_tp", -2.0))
+        measured_thresh = float(measured.get("input_thresh", -34.0))
+    else:
+        logger.warning("Could not measure loudness of redacted audio – using defaults.")
+        measured_i      = loudness_info if loudness_info is not None else -24.0
+        measured_lra    = 7.0
+        measured_tp     = -2.0
+        measured_thresh = -34.0
+
+    # Pass 2: apply loudnorm with measured values
     cmd = (
         ["ffmpeg", "-y"]
-        + _hwaccel_flags()
         + ["-i", modified_path,
            "-bitexact", "-ac", "1",
            "-strict", "-2",
            "-af", (
                f"loudnorm=I=-24:LRA=7:TP=-2:"
-               f"measured_I={measured_i:.2f}:linear=true:print_format=summary,"
+               f"measured_I={measured_i:.2f}:"
+               f"measured_LRA={measured_lra:.2f}:"
+               f"measured_TP={measured_tp:.2f}:"
+               f"measured_thresh={measured_thresh:.2f}:"
+               f"linear=true:print_format=summary,"
                "volume=0.90"
            )]
     )
@@ -749,11 +798,10 @@ def redact_audio(job_id: str) -> str:
 
     profanity_ts   = identify_profanity_timestamps(ts_data, profanity)
     duration       = ts_data["segments"][-1]["end"] if ts_data.get("segments") else 0.0
-    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)
-    filter_complex  = _build_ffmpeg_filter(profanity_ts, clean_intervals, duration)
 
-    # Redact SRT
-    srt_lines      = open(srt_path, encoding="utf-8").readlines()
+    # Redact SRT (always — even if no profanity, produce the _redacted copy)
+    with open(srt_path, encoding="utf-8") as srt_fh:
+        srt_lines = srt_fh.readlines()
     modified_lines = replace_words_in_srt(srt_lines, profanity)
     srt_base       = os.path.splitext(srt_filename)[0]
     out_srt_file   = f"{srt_base}_redacted_subtitle.srt"
@@ -761,6 +809,19 @@ def redact_audio(job_id: str) -> str:
     with open(out_srt_path, "w", encoding="utf-8") as f:
         f.writelines(modified_lines)
     update_config(job_id, {"redacted_srt": out_srt_file})
+
+    if not profanity_ts:
+        # No profanity detected — use center channel as-is (no bleeping needed)
+        logger.info("No profanity detected – skipping bleep filter.")
+        if channels <= 2:
+            update_config(job_id, {"redacted_audio_stream_final": center_file})
+        else:
+            update_config(job_id, {"redacted_channel_FC": center_file})
+        logger.info("Redaction complete (no profanity found).")
+        return "Redaction completed successfully (no profanity)"
+
+    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)
+    filter_complex  = _build_ffmpeg_filter(profanity_ts, clean_intervals, duration)
 
     # Apply bleep filter to center channel
     modified_center = apply_complex_filter_to_audio(
@@ -811,21 +872,11 @@ def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: in
 
     fc_idx = channels.index("FC")
 
-    # Build pan mapping: each output channel from original, except FC from redacted
-    pan_parts = []
-    for i, ch in enumerate(channels):
-        if ch == "FC":
-            pan_parts.append(f"c{i}=c0")          # from fc_input (mono, channel 0)
-        else:
-            src_c = i if i < fc_idx else i - 1     # original channels shift around FC
-            # We need to reference the correct source channel from the original stream
-            # Original stream has n channels; our redacted is mono replacing FC
-            pan_parts.append(f"c{i}=c{i}")         # from original stream directly
-
     # We use amerge + pan approach:
-    #   - input 0: original audio (n channels)
-    #   - input 1: redacted center (1 channel = FC replacement)
+    #   - input original_input_index: original audio (n channels)
+    #   - input fc_input_index: redacted center (1 channel = FC replacement)
     # amerge gives us n+1 channels total; then pan selects correctly.
+    # Original channels occupy c0..c(n-1); redacted FC occupies c(n).
     channel_map = "|".join(
         f"c{i}=c{n + 0}" if ch == "FC" else f"c{i}=c{i}"
         for i, ch in enumerate(channels)
@@ -989,8 +1040,19 @@ def cleanup_job_files(job_id: str) -> str:
     if not final_output:
         raise ValueError("final_output not set in config – nothing to clean up.")
 
+    # Sanitize filenames to prevent path traversal
+    safe_original = secure_filename(original_filename) if original_filename else None
+    if not safe_original:
+        raise ValueError("original_filename is missing or invalid in config.")
+
     final_path    = os.path.join(UPLOAD_FOLDER, final_output)
-    original_path = os.path.join(UPLOAD_FOLDER, original_filename)
+    original_path = os.path.join(UPLOAD_FOLDER, safe_original)
+
+    # Verify paths stay within UPLOAD_FOLDER
+    if not os.path.realpath(final_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+        raise ValueError("final_output path escapes upload folder.")
+    if not os.path.realpath(original_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+        raise ValueError("original_filename path escapes upload folder.")
 
     if not os.path.exists(final_path):
         raise FileNotFoundError(f"Final output not found: {final_path}")
@@ -1034,7 +1096,7 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
     import requests  # local import – only needed here
 
     def _update(status: str, stage: str = "") -> None:
-        job_status[job_id] = status
+        _set_job_status(job_id, status)
         update_config(job_id, {"pipeline_status": status, "pipeline_stage": stage})
         logger.info(f"[pipeline:{job_id}] {stage} → {status}")
 
@@ -1125,7 +1187,7 @@ def get_job_status(job_id: str):
         return _error("Job not found", 404, job_id)
     return jsonify({
         "job_id":   job_id,
-        "status":   job_status.get(job_id, config.get("pipeline_status", "unknown")),
+        "status":   _get_job_status(job_id) if _get_job_status(job_id) != "unknown" else config.get("pipeline_status", "unknown"),
         "stage":    config.get("pipeline_stage", ""),
         "error":    config.get("pipeline_error", ""),
     })
@@ -1137,7 +1199,7 @@ def get_job_status(job_id: str):
 def initialize_job():
     job_id = str(uuid.uuid4())
     update_config(job_id, {"job_id": job_id})
-    job_status[job_id] = "initialized"
+    _set_job_status(job_id, "initialized")
     logger.info(f"Initialized job {job_id}")
     return jsonify({"job_id": job_id})
 
@@ -1152,7 +1214,13 @@ def select_remote_file():
             return _error("filename is required", 400)
 
         safe_name = secure_filename(filename)
+        if not safe_name:
+            return _error("Invalid filename", 400)
         file_path = os.path.join(UPLOAD_FOLDER, safe_name)
+
+        # Validate resolved path stays within UPLOAD_FOLDER
+        if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+            return _error("Invalid file path", 400)
 
         if not os.path.isfile(file_path):
             return _error(f"File not found: {safe_name}", 404)
@@ -1168,7 +1236,7 @@ def select_remote_file():
         if not allowed_file(safe_name):
             return _error(f"Extension not allowed: {safe_name}", 400)
 
-        update_config(job_id, {"original_filename": filename, "input_filename": filename})
+        update_config(job_id, {"original_filename": safe_name, "input_filename": safe_name})
         return jsonify({"remote_file": filename, "job_id": job_id})
     except Exception as e:
         return _error(str(e), 500)
@@ -1322,17 +1390,21 @@ def api_process_full():
             job_id = str(uuid.uuid4())
             update_config(job_id, {"job_id": job_id})
 
-        job_status[job_id] = "queued"
+        _set_job_status(job_id, "queued")
 
         # Associate file if provided
         if filename:
             safe = secure_filename(filename)
+            if not safe:
+                return _error("Invalid filename", 400, job_id)
             file_path = os.path.join(UPLOAD_FOLDER, safe)
+            if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+                return _error("Invalid file path", 400, job_id)
             if not os.path.exists(file_path):
                 return _error(f"File not found: {safe}", 404, job_id)
             update_config(job_id, {
-                "original_filename": filename,
-                "input_filename":    filename,
+                "original_filename": safe,
+                "input_filename":    safe,
             })
         else:
             config = get_config(job_id)

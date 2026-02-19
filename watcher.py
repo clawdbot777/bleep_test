@@ -61,22 +61,24 @@ def _is_video(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
 
 
-def _wait_until_stable(path: str, wait: int = STABLE_WAIT_SECONDS) -> bool:
+def _wait_until_stable(path: str, wait: int = STABLE_WAIT_SECONDS,
+                       max_retries: int = 60) -> bool:
     """Wait until a file stops growing.  Returns True if stable, False if gone."""
-    logger.info(f"Waiting {wait}s for file to stabilise: {path}")
-    time.sleep(wait)
-    if not os.path.exists(path):
-        return False
-    # Check size again after waiting
-    size_before = os.path.getsize(path)
-    time.sleep(5)
-    if not os.path.exists(path):
-        return False
-    size_after = os.path.getsize(path)
-    if size_before != size_after:
+    for attempt in range(max_retries):
+        logger.info(f"Waiting {wait}s for file to stabilise: {path} (attempt {attempt + 1})")
+        time.sleep(wait)
+        if not os.path.exists(path):
+            return False
+        size_before = os.path.getsize(path)
+        time.sleep(5)
+        if not os.path.exists(path):
+            return False
+        size_after = os.path.getsize(path)
+        if size_before == size_after:
+            return True
         logger.info("File still growing – waiting another cycle.")
-        return _wait_until_stable(path, wait)
-    return True
+    logger.warning(f"File {path} still growing after {max_retries} retries – giving up.")
+    return False
 
 
 def submit_file(file_path: str) -> None:
