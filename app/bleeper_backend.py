@@ -953,7 +953,7 @@ def combine_media_file(job_id: str) -> str:
     base, ext = os.path.splitext(os.path.basename(input_media_file))
     output_file = f"{base}_final{ext}"
 
-    input_media_path   = os.path.join(UPLOAD_FOLDER, input_media_file)
+    input_media_path   = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_media_file)
     redacted_audio_path = os.path.join(UPLOAD_FOLDER, redacted_audio)
     redacted_srt_path  = os.path.join(UPLOAD_FOLDER, redacted_srt)
     output_path        = os.path.join(UPLOAD_FOLDER, output_file)
