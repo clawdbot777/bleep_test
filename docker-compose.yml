@@ -52,10 +52,8 @@ services:
       # Staging area: bleeper writes temp files here during processing
       - bleeper_uploads:/app/uploads
 
-      # Your media library: must match the paths Radarr/Sonarr/Plex use.
-      # Adjust to your actual mount points.
-      - /mnt/user/media:/media         # Unraid example
-      # - /media/nas/media:/media      # generic Linux example
+      # Your media library: use /data/media to match arr stack convention
+      - /mnt/user/media:/data/media         # Unraid example
 
     # Optional: share the network with your arr stack so arr_hook.py
     # can reach bleeper at http://bleeper:5000 by container name.

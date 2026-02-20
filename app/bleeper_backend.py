@@ -56,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Job state tracker  {job_id: 'pending'|'running'|'completed'|'failed'}
+# Job state tracker  {job_id: 'queued'|'running'|'completed'|'failed'}
 _job_status_lock = threading.Lock()
 job_status: dict[str, str] = {}
 
@@ -70,7 +70,48 @@ def _get_job_status(job_id: str) -> str:
     with _job_status_lock:
         return job_status.get(job_id, "unknown")
 
-UPLOAD_FOLDER    = "/tmp/uploads"
+
+# ---------------------------------------------------------------------------
+# Single-worker pipeline queue — ensures jobs run one at a time so the GPU
+# isn't hammered by concurrent whisperX/ffmpeg processes.
+# ---------------------------------------------------------------------------
+import queue as _queue
+
+_pipeline_queue: _queue.Queue = _queue.Queue()
+_pipeline_queue_order: list = []   # track position for status reporting
+_pipeline_queue_lock = threading.Lock()
+
+
+def _pipeline_worker() -> None:
+    """Single background worker that drains the pipeline queue."""
+    while True:
+        job_id, fn, args = _pipeline_queue.get()
+        with _pipeline_queue_lock:
+            if job_id in _pipeline_queue_order:
+                _pipeline_queue_order.remove(job_id)
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.error(f"[queue] Unhandled error for job {job_id}: {e}")
+        finally:
+            _pipeline_queue.task_done()
+
+
+def _queue_pipeline(job_id: str, fn, args: tuple) -> int:
+    """Enqueue a pipeline job. Returns queue position (1 = next up)."""
+    with _pipeline_queue_lock:
+        _pipeline_queue_order.append(job_id)
+        position = len(_pipeline_queue_order)
+    _pipeline_queue.put((job_id, fn, args))
+    return position
+
+
+# Start the single worker thread (daemon so it dies with the process)
+_worker_thread = threading.Thread(target=_pipeline_worker, daemon=True)
+_worker_thread.start()
+logger.info("Pipeline queue worker started.")
+
+UPLOAD_FOLDER    = os.environ.get("BLEEPER_UPLOAD", "/app/uploads")
 TEMP_FOLDER      = "/tmp/uploads/tmp"
 PROCESSED_FOLDER = "/tmp/uploads/processed"
 FILTER_LIST_PATH = os.path.join(os.path.dirname(__file__), "filter_list.txt")
@@ -189,6 +230,26 @@ def _probe(path: str) -> dict:
 # Section 3 – Job config persistence
 # ---------------------------------------------------------------------------
 
+def find_job_by_filename(filename: str) -> dict | None:
+    """
+    Look for an existing incomplete job for the given filename.
+    Returns the config dict if found and not yet completed, else None.
+    """
+    basename = os.path.basename(filename)
+    for config_file in glob.glob(os.path.join(UPLOAD_FOLDER, "*_config.json")):
+        try:
+            with open(config_file) as f:
+                config = json.load(f)
+            if (config.get("original_filename") == basename or
+                    config.get("input_filepath") == filename):
+                status = config.get("pipeline_status", "")
+                if status not in ("completed",):
+                    return config
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
 def get_config(job_id: str) -> dict | None:
     config_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_config.json")
     if not os.path.exists(config_path):
@@ -260,7 +321,9 @@ def analyze_and_select_audio_stream(job_id: str) -> dict:
     if not input_file:
         raise ValueError(f"No input_filename in config for job_id: {job_id}")
 
-    input_path = os.path.join(UPLOAD_FOLDER, input_file)
+    # Use stored absolute path if available (e.g. passed directly from arr hook)
+    # otherwise fall back to uploads folder
+    input_path = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_file)
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
@@ -322,7 +385,7 @@ def normalize_audio_stream(job_id: str, force: bool = False) -> str | None:
         update_config(job_id, {"normalization_skipped": True})
         return None
 
-    input_path   = os.path.join(UPLOAD_FOLDER, input_file)
+    input_path   = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_file)
     base          = os.path.splitext(input_file)[0]
     norm_file     = f"{base}_norm.{NORMALIZE_TARGET_CODEC}"
     norm_path     = os.path.join(UPLOAD_FOLDER, norm_file)
@@ -391,6 +454,23 @@ def _extract_center_channel(input_path: str, codec: str, bit_rate: int,
     return center_file, center_path
 
 
+def _extract_loudnorm_json(output: str) -> dict | None:
+    """
+    Robustly extract the loudnorm JSON block from ffmpeg stderr.
+    Filenames may contain { } (e.g. {tmdb-1214931}) so we can't just
+    use find('{') — scan all blocks for one containing 'input_i'.
+    """
+    import re
+    for match in re.finditer(r'\{[^{}]+\}', output, re.DOTALL):
+        try:
+            candidate = json.loads(match.group())
+            if "input_i" in candidate:
+                return candidate
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _measure_loudness(audio_path: str) -> float:
     """Return integrated loudness (input_i) of an audio file using loudnorm."""
     cmd = [
@@ -401,11 +481,12 @@ def _measure_loudness(audio_path: str) -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stderr or result.stdout
-    j_start = output.find("{")
-    j_end   = output.rfind("}") + 1
-    if j_start == -1:
+
+    info = _extract_loudnorm_json(output)
+    if not info:
         raise ValueError("No JSON from loudnorm – cannot measure loudness.")
-    info = json.loads(output[j_start:j_end])
+    # Remove the old fallback regex block that was here
+
     input_i = info.get("input_i")
     if input_i is None:
         raise ValueError("input_i missing from loudnorm JSON.")
@@ -728,11 +809,10 @@ def normalize_center_audio(modified_file: str, bitrate=None, sample_rate=None,
     ]
     result = subprocess.run(measure_cmd, capture_output=True, text=True)
     output = result.stderr or result.stdout
-    j_start = output.find("{")
-    j_end   = output.rfind("}") + 1
 
-    if j_start != -1 and j_end > j_start:
-        measured = json.loads(output[j_start:j_end])
+    # Use same robust JSON extraction as _measure_loudness
+    measured = _extract_loudnorm_json(output)
+    if measured:
         measured_i     = float(measured.get("input_i", -24.0))
         measured_lra   = float(measured.get("input_lra", 7.0))
         measured_tp    = float(measured.get("input_tp", -2.0))
@@ -914,48 +994,49 @@ def combine_media_file(job_id: str) -> str:
     base, ext = os.path.splitext(os.path.basename(input_media_file))
     output_file = f"{base}_final{ext}"
 
-    input_media_path   = os.path.join(UPLOAD_FOLDER, input_media_file)
+    input_media_path    = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_media_file)
     redacted_audio_path = os.path.join(UPLOAD_FOLDER, redacted_audio)
-    redacted_srt_path  = os.path.join(UPLOAD_FOLDER, redacted_srt)
-    output_path        = os.path.join(UPLOAD_FOLDER, output_file)
+    redacted_srt_path   = os.path.join(UPLOAD_FOLDER, redacted_srt)
+    output_path         = os.path.join(UPLOAD_FOLDER, output_file)
 
-    # Build dynamic filter based on actual layout
+    # Inspect existing subtitle streams — strip MOV/tx3g, keep SRT/ASS/PGS
+    MOV_SUB_CODECS = {"mov_text", "tx3g", "mp4s"}
+    try:
+        probe = _probe(input_media_path)
+        all_streams   = probe.get("streams", [])
+        sub_streams   = [s for s in all_streams if s.get("codec_type") == "subtitle"]
+        keep_sub_idxs = [i for i, s in enumerate(sub_streams)
+                         if s.get("codec_name", "").lower() not in MOV_SUB_CODECS]
+        redacted_sub_idx = len(keep_sub_idxs)   # redacted SRT goes after kept subs
+    except Exception:
+        sub_streams      = []
+        keep_sub_idxs    = []
+        redacted_sub_idx = 0
+
+    # Build sub map args — only kept subtitle streams
+    sub_map_args = [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
+    sub_map_args += ["-map", "2:s"]   # placeholder; overridden per-command for multichannel
+
     if channels <= 2:
-        # Mono/stereo: redacted audio IS the family track – no merging needed
-        filter_complex = "[1:a]acopy[final]"
-    else:
-        filter_complex = _build_pan_filter(layout, fc_input_index=1, original_input_index=0)
-        # Rewire: input 0 = extracted audio stream (not raw mkv) for the filter
-        # We need the full audio stream as input for the pan, plus the MKV for video
-
-    # Build ffmpeg command
-    # Inputs: [0]=original MKV, [1]=redacted FC audio, [2]=redacted SRT
-    # For the pan filter we reference [0:a] which is the selected audio track
-    # from the original MKV (map 0:a:<idx>).
-    # We add the redacted audio as a second input file for the FC replacement.
-
-    if channels <= 2:
-        # Simple: just swap in the redacted audio track
         cmd = (
             ["ffmpeg", "-y"]
             + _hwaccel_flags()
             + [
-                "-i", input_media_path,       # 0: original
-                "-i", redacted_audio_path,    # 1: redacted audio
-                "-i", redacted_srt_path,      # 2: subs
-                "-map", "0:v",                # video from original
-                "-map", "1:a",                # family audio = redacted
-                "-map", f"0:a:{orig_stream_idx}",  # original audio preserved
-                "-map", "2:s",                # redacted subs
-                "-c:v", "copy",
-                "-c:a:0", codec,
-                "-c:a:1", "copy",
+                "-i", input_media_path,              # 0: original
+                "-i", redacted_audio_path,           # 1: redacted audio
+                "-i", redacted_srt_path,             # 2: redacted SRT
+                "-map", "0:v",
+                "-map", "1:a",                       # family audio
+                "-map", f"0:a:{orig_stream_idx}",    # original audio
+            ]
+            + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
+            + ["-map", "2:s",                        # redacted SRT
+               "-c:v", "copy",
+               "-c:a:0", codec,
+               "-c:a:1", "copy",
             ]
         )
     else:
-        # Multichannel: extract audio stream first for the filter, then combine
-        # Use filter_complex to merge original audio + redacted FC
-        # Input 0 = extracted original audio stream, Input 1 = redacted FC, Input 2 = subs
         audio_file  = config.get("audio_filename")
         audio_path  = os.path.join(UPLOAD_FOLDER, audio_file) if audio_file else None
 
@@ -964,37 +1045,40 @@ def combine_media_file(job_id: str) -> str:
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
                 + [
-                    "-i", input_media_path,          # 0: original MKV (video + original audio)
-                    "-i", audio_path,                # 1: extracted audio stream
-                    "-i", redacted_audio_path,       # 2: redacted FC (mono)
-                    "-i", redacted_srt_path,         # 3: redacted subs
+                    "-i", input_media_path,              # 0: original MKV
+                    "-i", audio_path,                    # 1: extracted audio
+                    "-i", redacted_audio_path,           # 2: redacted FC
+                    "-i", redacted_srt_path,             # 3: redacted SRT
                     "-filter_complex",
                     _build_pan_filter(layout, fc_input_index=2, original_input_index=1),
-                    "-map", "0:v",                   # video
-                    "-map", "[final]",               # family audio (rebuilt)
-                    "-map", f"0:a:{orig_stream_idx}",# original audio track
-                    "-map", "3:s",                   # subs
-                    "-c:v", "copy",
-                    "-c:a:0", codec,
+                    "-map", "0:v",
+                    "-map", "[final]",                   # family audio
+                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                ]
+                + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
+                + ["-map", "3:s",                        # redacted SRT
+                   "-c:v", "copy",
+                   "-c:a:0", codec,
                 ]
             )
         else:
-            # Fallback: reference original MKV audio directly
             cmd = (
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
                 + [
-                    "-i", input_media_path,
-                    "-i", redacted_audio_path,
-                    "-i", redacted_srt_path,
+                    "-i", input_media_path,              # 0: original MKV
+                    "-i", redacted_audio_path,           # 1: redacted FC
+                    "-i", redacted_srt_path,             # 2: redacted SRT
                     "-filter_complex",
                     _build_pan_filter(layout, fc_input_index=1, original_input_index=0),
                     "-map", "0:v",
-                    "-map", "[final]",
-                    "-map", f"0:a:{orig_stream_idx}",
-                    "-map", "2:s",
-                    "-c:v", "copy",
-                    "-c:a:0", codec,
+                    "-map", "[final]",                   # family audio
+                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                ]
+                + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
+                + ["-map", "2:s",                        # redacted SRT
+                   "-c:v", "copy",
+                   "-c:a:0", codec,
                 ]
             )
 
@@ -1002,17 +1086,19 @@ def combine_media_file(job_id: str) -> str:
     if sample_rate: cmd += ["-ar", str(sample_rate)]
 
     cmd += ["-c:a:1", "copy"]
-    cmd += ["-c:s", "mov_text" if ext == ".mp4" else "srt"]
+    cmd += ["-c:s", "copy"]                          # copy all kept subs as-is
+    cmd += [f"-c:s:{redacted_sub_idx}", "srt"]       # force srt for redacted track
+
     cmd += [
         "-metadata:s:a:0", "title=Family audio",
         "-metadata:s:a:0", "language=eng",
-        "-disposition:a:0", "default",
+        "-disposition:a:0", "default",               # family audio = default
         "-metadata:s:a:1", "title=Original audio",
         "-metadata:s:a:1", "language=eng",
         "-disposition:a:1", "0",
-        "-metadata:s:s:0", "title=Redacted subtitles",
-        "-metadata:s:s:0", "language=eng",
-        "-disposition:s:0", "default",
+        f"-metadata:s:s:{redacted_sub_idx}", "title=Redacted subtitles",
+        f"-metadata:s:s:{redacted_sub_idx}", "language=eng",
+        f"-disposition:s:{redacted_sub_idx}", "default",   # redacted subs = default
         "-strict", "-2",
         output_path,
     ]
@@ -1040,44 +1126,69 @@ def cleanup_job_files(job_id: str) -> str:
     if not final_output:
         raise ValueError("final_output not set in config – nothing to clean up.")
 
-    # Sanitize filenames to prevent path traversal
-    safe_original = secure_filename(original_filename) if original_filename else None
+    # Use original filename as-is — secure_filename strips { } [ ] which
+    # are valid in arr-generated filenames. Path traversal is prevented
+    # by the realpath check below.
+    safe_original = os.path.basename(original_filename) if original_filename else None
     if not safe_original:
         raise ValueError("original_filename is missing or invalid in config.")
 
-    final_path    = os.path.join(UPLOAD_FOLDER, final_output)
-    original_path = os.path.join(UPLOAD_FOLDER, safe_original)
-
-    # Verify paths stay within UPLOAD_FOLDER
-    if not os.path.realpath(final_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-        raise ValueError("final_output path escapes upload folder.")
-    if not os.path.realpath(original_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-        raise ValueError("original_filename path escapes upload folder.")
-
+    final_path = os.path.join(UPLOAD_FOLDER, final_output)
     if not os.path.exists(final_path):
         raise FileNotFoundError(f"Final output not found: {final_path}")
 
-    os.rename(final_path, original_path)
-    logger.info(f"Renamed {final_output} → {original_filename}")
+    # If the file came from an absolute path on the media volume,
+    # move the output back there (overwrite original with bleeped version).
+    # Otherwise fall back to placing it in the uploads folder.
+    input_filepath = config.get("input_filepath")
+    if input_filepath:
+        dest_path = input_filepath
+    else:
+        dest_path = os.path.join(UPLOAD_FOLDER, safe_original)
+        if not os.path.realpath(dest_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+            raise ValueError("original_filename path escapes upload folder.")
+
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    try:
+        os.replace(final_path, dest_path)
+        logger.info(f"Moved (same device) {final_output} → {dest_path}")
+    except OSError as e:
+        if e.errno == 18:  # cross-device link — fall back to copy + delete
+            logger.info(f"Cross-device move detected, copying {final_output} → {dest_path}")
+            shutil.copy2(final_path, dest_path)
+            os.remove(final_path)
+            logger.info(f"Copy complete, removed source {final_path}")
+        else:
+            raise
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
-        f"{job_id}_*",
+        f"{job_id}_*",           # config + any job-tagged files
         f"{base}_center*.*",
         f"{base}_audio*.*",
-        f"{base}_norm.*",
+        f"{base}_norm*.*",
         f"{base}_*redacted*.*",
         f"{base}_*normalized*.*",
         f"{base}_*final*.*",
+        f"{base}*.json",         # whisperX transcript
+        f"{base}*.srt",          # raw + redacted SRT
+        f"{base}*.ac3",          # normalized + extracted audio
+        f"{base}*.dts",
+        f"{base}*.aac",
+        f"{base}*.flac",
+        f"{base}*.wav",
     ]
+    removed = []
     for pattern in patterns:
         for f in glob.glob(os.path.join(UPLOAD_FOLDER, pattern)):
-            if os.path.isfile(f) and f != original_path:
+            if os.path.isfile(f) and os.path.abspath(f) != os.path.abspath(dest_path):
                 os.remove(f)
-                logger.debug(f"Removed: {f}")
+                removed.append(os.path.basename(f))
 
+    if removed:
+        logger.info(f"Cleanup removed {len(removed)} temp files: {', '.join(removed)}")
     logger.info(f"Cleanup done for job {job_id}.")
-    return original_filename
+    return dest_path
 
 
 # ---------------------------------------------------------------------------
@@ -1100,24 +1211,83 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
         update_config(job_id, {"pipeline_status": status, "pipeline_stage": stage})
         logger.info(f"[pipeline:{job_id}] {stage} → {status}")
 
+    def _already_done(stage: str) -> bool:
+        """Return True if this stage already completed in a prior run."""
+        config = get_config(job_id) or {}
+        completed = config.get("completed_stages", [])
+        if stage in completed:
+            return True
+        # Fallback: check if the expected output file already exists
+        file_checks = {
+            "analyze_audio":  lambda c: c.get("audio_stream_index_nr") is not None,
+            "normalize_audio": lambda c: c.get("normalization_skipped") or (
+                c.get("normalized_audio_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("normalized_audio_file", "")))),
+            "extract_audio":  lambda c: c.get("center_channel_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("center_channel_file", ""))),
+            "transcribe":     lambda c: c.get("srt_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("srt_file", ""))),
+            "redact":         lambda c: c.get("redacted_srt") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("redacted_srt", ""))),
+            "combine":        lambda c: c.get("final_output") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("final_output", ""))),
+        }
+        check = file_checks.get(stage)
+        if check and check(config):
+            logger.info(f"[pipeline:{job_id}] {stage} → output exists, marking done")
+            _mark_done(stage)
+            return True
+        return False
+
+    def _mark_done(stage: str) -> None:
+        config = get_config(job_id) or {}
+        completed = config.get("completed_stages", [])
+        if stage not in completed:
+            completed.append(stage)
+        update_config(job_id, {"completed_stages": completed})
+
     try:
-        _update("running", "analyze_audio")
-        analyze_and_select_audio_stream(job_id)
+        if not _already_done("analyze_audio"):
+            _update("running", "analyze_audio")
+            analyze_and_select_audio_stream(job_id)
+            _mark_done("analyze_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] analyze_audio → skipped (already done)")
 
-        _update("running", "normalize_audio")
-        normalize_audio_stream(job_id)
+        if not _already_done("normalize_audio"):
+            _update("running", "normalize_audio")
+            normalize_audio_stream(job_id)
+            _mark_done("normalize_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] normalize_audio → skipped (already done)")
 
-        _update("running", "extract_audio")
-        extract_audio_stream(job_id)
+        if not _already_done("extract_audio"):
+            _update("running", "extract_audio")
+            extract_audio_stream(job_id)
+            _mark_done("extract_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] extract_audio → skipped (already done)")
 
-        _update("running", "transcribe")
-        transcribe_audio(job_id, whisperx_settings)
+        if not _already_done("transcribe"):
+            _update("running", "transcribe")
+            transcribe_audio(job_id, whisperx_settings)
+            _mark_done("transcribe")
+        else:
+            logger.info(f"[pipeline:{job_id}] transcribe → skipped (already done)")
 
-        _update("running", "redact")
-        redact_audio(job_id)
+        if not _already_done("redact"):
+            _update("running", "redact")
+            redact_audio(job_id)
+            _mark_done("redact")
+        else:
+            logger.info(f"[pipeline:{job_id}] redact → skipped (already done)")
 
-        _update("running", "combine")
-        combine_media_file(job_id)
+        if not _already_done("combine"):
+            _update("running", "combine")
+            combine_media_file(job_id)
+            _mark_done("combine")
+        else:
+            logger.info(f"[pipeline:{job_id}] combine → skipped (already done)")
 
         _update("running", "cleanup")
         cleanup_job_files(job_id)
@@ -1196,11 +1366,16 @@ def get_job_status(job_id: str):
     config = get_config(job_id)
     if not config:
         return _error("Job not found", 404, job_id)
+    with _pipeline_queue_lock:
+        queue_position = (_pipeline_queue_order.index(job_id) + 1
+                          if job_id in _pipeline_queue_order else None)
     return jsonify({
-        "job_id":   job_id,
-        "status":   _get_job_status(job_id) if _get_job_status(job_id) != "unknown" else config.get("pipeline_status", "unknown"),
-        "stage":    config.get("pipeline_stage", ""),
-        "error":    config.get("pipeline_error", ""),
+        "job_id":         job_id,
+        "status":         _get_job_status(job_id) if _get_job_status(job_id) != "unknown" else config.get("pipeline_status", "unknown"),
+        "stage":          config.get("pipeline_stage", ""),
+        "error":          config.get("pipeline_error", ""),
+        "queue_position": queue_position,   # None = running or done, N = waiting
+        "queue_depth":    _pipeline_queue.qsize(),
     })
 
 
@@ -1396,8 +1571,17 @@ def api_process_full():
         job_id   = data.get("job_id")
         filename = data.get("filename")
 
-        # Create job if not supplied
-        if not job_id:
+        # Resume existing incomplete job for this filename if one exists
+        if filename and not job_id:
+            existing = find_job_by_filename(filename)
+            if existing:
+                job_id = existing["job_id"]
+                last_stage = existing.get("pipeline_stage", "")
+                logger.info(f"Resuming existing job {job_id} for {os.path.basename(filename)} (last stage: {last_stage})")
+            else:
+                job_id = str(uuid.uuid4())
+                update_config(job_id, {"job_id": job_id})
+        elif not job_id:
             job_id = str(uuid.uuid4())
             update_config(job_id, {"job_id": job_id})
 
@@ -1405,18 +1589,30 @@ def api_process_full():
 
         # Associate file if provided
         if filename:
-            safe = secure_filename(filename)
-            if not safe:
-                return _error("Invalid filename", 400, job_id)
-            file_path = os.path.join(UPLOAD_FOLDER, safe)
-            if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-                return _error("Invalid file path", 400, job_id)
-            if not os.path.exists(file_path):
-                return _error(f"File not found: {safe}", 404, job_id)
-            update_config(job_id, {
-                "original_filename": safe,
-                "input_filename":    safe,
-            })
+            # If an absolute path is provided and it exists, use it directly
+            # (file lives on the shared media volume, no copy needed)
+            if os.path.isabs(filename) and os.path.exists(filename):
+                safe = os.path.basename(filename)
+                update_config(job_id, {
+                    "original_filename": safe,
+                    "input_filename":    safe,
+                    "input_filepath":    filename,   # full absolute path
+                })
+            else:
+                # Filename only — look in uploads folder (legacy / upload flow)
+                # Use the original filename as-is (don't sanitize — arr filenames
+                # contain brackets/spaces that secure_filename would strip)
+                safe = os.path.basename(filename)
+                file_path = os.path.join(UPLOAD_FOLDER, safe)
+                # Prevent path traversal
+                if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+                    return _error("Invalid file path", 400, job_id)
+                if not os.path.exists(file_path):
+                    return _error(f"File not found in uploads: {safe}", 404, job_id)
+                update_config(job_id, {
+                    "original_filename": safe,
+                    "input_filename":    safe,
+                })
         else:
             config = get_config(job_id)
             if not config or not config.get("input_filename"):
@@ -1430,17 +1626,18 @@ def api_process_full():
         plex_token        = data.get("plex_token")
         plex_section_id   = data.get("plex_section_id")
 
-        thread = threading.Thread(
-            target=run_full_pipeline,
-            args=(job_id, whisperx_settings, plex_url, plex_token, plex_section_id),
-            daemon=True,
+        position = _queue_pipeline(
+            job_id,
+            run_full_pipeline,
+            (job_id, whisperx_settings, plex_url, plex_token, plex_section_id),
         )
-        thread.start()
 
+        msg = "Pipeline started." if position == 1 else f"Queued at position {position} — will start after current job finishes."
         return jsonify({
-            "status":  "queued",
-            "job_id":  job_id,
-            "message": "Pipeline started. Poll /api/job_status/<job_id> for progress.",
+            "status":   "queued",
+            "job_id":   job_id,
+            "position": position,
+            "message":  f"{msg} Poll /api/job_status/<job_id> for progress.",
         }), 202
 
     except Exception as e:

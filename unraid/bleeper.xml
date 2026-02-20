@@ -48,10 +48,10 @@
 
   <Config
     Name="Media Library"
-    Target="/media"
+    Target="/data/media"
     Default="/mnt/user/media"
     Mode="rw"
-    Description="Your media library root. Must match the paths used by Radarr, Sonarr, and Plex so filenames resolve correctly."
+    Description="Your media library root. Container path /data/media matches the standard arr stack convention so no path translation is needed."
     Type="Path"
     Display="always"
     Required="true"
