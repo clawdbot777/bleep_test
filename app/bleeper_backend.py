@@ -1022,20 +1022,18 @@ def combine_media_file(job_id: str) -> str:
             + [
                 "-i", input_media_path,       # 0: original
                 "-i", redacted_audio_path,    # 1: redacted audio
-                "-i", redacted_srt_path,      # 2: subs
+                "-i", redacted_srt_path,      # 2: redacted SRT
                 "-map", "0:v",                # video from original
                 "-map", "1:a",                # family audio = redacted
                 "-map", f"0:a:{orig_stream_idx}",  # original audio preserved
-                "-map", "2:s",                # redacted subs
+                "-map", "0:s?",              # all existing subs from original
+                "-map", "2:s",               # redacted SRT appended
                 "-c:v", "copy",
                 "-c:a:0", codec,
                 "-c:a:1", "copy",
             ]
         )
     else:
-        # Multichannel: extract audio stream first for the filter, then combine
-        # Use filter_complex to merge original audio + redacted FC
-        # Input 0 = extracted original audio stream, Input 1 = redacted FC, Input 2 = subs
         audio_file  = config.get("audio_filename")
         audio_path  = os.path.join(UPLOAD_FOLDER, audio_file) if audio_file else None
 
@@ -1044,16 +1042,17 @@ def combine_media_file(job_id: str) -> str:
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
                 + [
-                    "-i", input_media_path,          # 0: original MKV (video + original audio)
+                    "-i", input_media_path,          # 0: original MKV
                     "-i", audio_path,                # 1: extracted audio stream
                     "-i", redacted_audio_path,       # 2: redacted FC (mono)
-                    "-i", redacted_srt_path,         # 3: redacted subs
+                    "-i", redacted_srt_path,         # 3: redacted SRT
                     "-filter_complex",
                     _build_pan_filter(layout, fc_input_index=2, original_input_index=1),
                     "-map", "0:v",                   # video
                     "-map", "[final]",               # family audio (rebuilt)
                     "-map", f"0:a:{orig_stream_idx}",# original audio track
-                    "-map", "3:s",                   # subs
+                    "-map", "0:s?",                  # all existing subs from original
+                    "-map", "3:s",                   # redacted SRT appended
                     "-c:v", "copy",
                     "-c:a:0", codec,
                 ]
@@ -1072,7 +1071,8 @@ def combine_media_file(job_id: str) -> str:
                     "-map", "0:v",
                     "-map", "[final]",
                     "-map", f"0:a:{orig_stream_idx}",
-                    "-map", "2:s",
+                    "-map", "0:s?",              # all existing subs from original
+                    "-map", "2:s",               # redacted SRT appended
                     "-c:v", "copy",
                     "-c:a:0", codec,
                 ]
@@ -1082,7 +1082,24 @@ def combine_media_file(job_id: str) -> str:
     if sample_rate: cmd += ["-ar", str(sample_rate)]
 
     cmd += ["-c:a:1", "copy"]
-    cmd += ["-c:s", "mov_text" if ext == ".mp4" else "srt"]
+
+    # Subtitle handling:
+    # - Copy all existing subtitle streams from original as-is (don't transcode)
+    # - Append the redacted SRT as an additional subtitle track
+    # - mov_text in MKV is remuxed safely with -c:s copy
+    cmd += ["-c:s", "copy"]
+
+    # The redacted SRT is input 3 (or 2 for simple path) — always force srt codec for it
+    # We need to set the codec for just that stream index
+    # Count existing subtitle streams to get the right index
+    try:
+        probe = _probe(input_media_path)
+        existing_subs = [s for s in probe.get("streams", []) if s.get("codec_type") == "subtitle"]
+        redacted_sub_idx = len(existing_subs)  # new sub goes after existing ones
+    except Exception:
+        redacted_sub_idx = 0
+
+    cmd += [f"-c:s:{redacted_sub_idx}", "srt"]
     cmd += [
         "-metadata:s:a:0", "title=Family audio",
         "-metadata:s:a:0", "language=eng",
@@ -1090,9 +1107,9 @@ def combine_media_file(job_id: str) -> str:
         "-metadata:s:a:1", "title=Original audio",
         "-metadata:s:a:1", "language=eng",
         "-disposition:a:1", "0",
-        "-metadata:s:s:0", "title=Redacted subtitles",
-        "-metadata:s:s:0", "language=eng",
-        "-disposition:s:0", "default",
+        f"-metadata:s:s:{redacted_sub_idx}", "title=Redacted subtitles",
+        f"-metadata:s:s:{redacted_sub_idx}", "language=eng",
+        f"-disposition:s:{redacted_sub_idx}", "0",
         "-strict", "-2",
         output_path,
     ]
