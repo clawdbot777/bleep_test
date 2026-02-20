@@ -403,11 +403,32 @@ def _measure_loudness(audio_path: str) -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stderr or result.stdout
-    j_start = output.find("{")
-    j_end   = output.rfind("}") + 1
+
+    # ffmpeg filenames may contain { } so find the loudnorm JSON block
+    # specifically — it starts after the last '[Parsed_loudnorm' line
+    # and contains "input_i" as a key.
+    j_start = output.rfind('{\n')
     if j_start == -1:
+        j_start = output.rfind('{')
+    j_end = output.find('}', j_start) + 1
+    if j_start == -1 or j_end == 0:
         raise ValueError("No JSON from loudnorm – cannot measure loudness.")
-    info = json.loads(output[j_start:j_end])
+    try:
+        info = json.loads(output[j_start:j_end])
+    except json.JSONDecodeError:
+        # Fallback: scan all { } blocks for one containing input_i
+        import re
+        for match in re.finditer(r'\{[^{}]+\}', output, re.DOTALL):
+            try:
+                candidate = json.loads(match.group())
+                if "input_i" in candidate:
+                    info = candidate
+                    break
+            except json.JSONDecodeError:
+                continue
+        else:
+            raise ValueError("Could not parse loudnorm JSON from ffmpeg output.")
+
     input_i = info.get("input_i")
     if input_i is None:
         raise ValueError("input_i missing from loudnorm JSON.")
