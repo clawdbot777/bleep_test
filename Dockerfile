@@ -89,10 +89,11 @@ RUN mkdir -p /app/uploads /media
 
 ENV BLEEPER_UPLOAD=/app/uploads \
     WATCH_FOLDER=/media/incoming \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 EXPOSE 5000
 
 # Single gunicorn worker — job_status is in-process.
 # Increase --timeout for long whisperX transcription jobs.
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "600", "run:app"]
+CMD ["python", "-m", "gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "600", "run:app"]
