@@ -6,16 +6,8 @@
 #   2. Radarr/Sonarr → Settings → Connect → Custom Script
 #      Script path: /path/to/arr_hook.sh
 #      Events: On Import, On Upgrade
-#
-# Configure the variables below:
 
 BLEEPER_URL="http://bleeper:5000"
-
-# Path translation: arr sees media at ARR_MEDIA_ROOT, bleeper sees it at BLEEPER_MEDIA_ROOT
-# Check your volume mappings in each container to confirm these.
-# Example: Radarr has /data/media mapped, bleeper has /media mapped → same host folder.
-ARR_MEDIA_ROOT="/data/media"
-BLEEPER_MEDIA_ROOT="/media"
 
 # ── Detect arr type and get file path ────────────────────────────────────────
 if [ -n "$radarr_eventtype" ]; then
@@ -29,7 +21,6 @@ else
     exit 0
 fi
 
-# Only act on import/upgrade events
 case "$EVENT" in
     Download|EpisodeFileImport|MovieFileImport) ;;
     Test) echo "[bleeper] Test event received - OK"; exit 0 ;;
@@ -41,20 +32,13 @@ if [ -z "$FILE_PATH" ]; then
     exit 0
 fi
 
-# Translate path from arr's view → bleeper's view
-BLEEPER_PATH="${FILE_PATH#$ARR_MEDIA_ROOT}"
-BLEEPER_PATH="$BLEEPER_MEDIA_ROOT$BLEEPER_PATH"
-
-FILENAME=$(basename "$FILE_PATH")
-echo "[bleeper] Submitting: $FILENAME"
-echo "[bleeper] Path (arr):     $FILE_PATH"
-echo "[bleeper] Path (bleeper): $BLEEPER_PATH"
+echo "[bleeper] Submitting: $FILE_PATH"
 
 # ── POST to bleeper API ───────────────────────────────────────────────────────
 RESPONSE=$(curl -s -w "\n%{http_code}" \
     -X POST "$BLEEPER_URL/api/process_full" \
     -H "Content-Type: application/json" \
-    -d "{\"filename\": \"$BLEEPER_PATH\"}" \
+    -d "{\"filename\": \"$FILE_PATH\"}" \
     --connect-timeout 10 \
     --max-time 30)
 
