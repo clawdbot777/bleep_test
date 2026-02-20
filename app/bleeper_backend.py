@@ -260,7 +260,9 @@ def analyze_and_select_audio_stream(job_id: str) -> dict:
     if not input_file:
         raise ValueError(f"No input_filename in config for job_id: {job_id}")
 
-    input_path = os.path.join(UPLOAD_FOLDER, input_file)
+    # Use stored absolute path if available (e.g. passed directly from arr hook)
+    # otherwise fall back to uploads folder
+    input_path = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_file)
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
@@ -322,7 +324,7 @@ def normalize_audio_stream(job_id: str, force: bool = False) -> str | None:
         update_config(job_id, {"normalization_skipped": True})
         return None
 
-    input_path   = os.path.join(UPLOAD_FOLDER, input_file)
+    input_path   = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, input_file)
     base          = os.path.splitext(input_file)[0]
     norm_file     = f"{base}_norm.{NORMALIZE_TARGET_CODEC}"
     norm_path     = os.path.join(UPLOAD_FOLDER, norm_file)
