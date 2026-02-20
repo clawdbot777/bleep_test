@@ -40,10 +40,12 @@ FILENAME=$(basename "$FILE_PATH")
 echo "[bleeper] Submitting: $FILENAME"
 
 # ── POST to bleeper API ───────────────────────────────────────────────────────
+# Pass the full file path — bleeper accesses it directly via the shared
+# media volume. No copying required (avoids duplicating large files).
 RESPONSE=$(curl -s -w "\n%{http_code}" \
     -X POST "$BLEEPER_URL/api/process_full" \
     -H "Content-Type: application/json" \
-    -d "{\"filename\": \"$FILENAME\"}" \
+    -d "{\"filename\": \"$FILE_PATH\"}" \
     --connect-timeout 10 \
     --max-time 30)
 

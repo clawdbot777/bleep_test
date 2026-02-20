@@ -1405,18 +1405,30 @@ def api_process_full():
 
         # Associate file if provided
         if filename:
-            safe = secure_filename(filename)
-            if not safe:
-                return _error("Invalid filename", 400, job_id)
-            file_path = os.path.join(UPLOAD_FOLDER, safe)
-            if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-                return _error("Invalid file path", 400, job_id)
-            if not os.path.exists(file_path):
-                return _error(f"File not found: {safe}", 404, job_id)
-            update_config(job_id, {
-                "original_filename": safe,
-                "input_filename":    safe,
-            })
+            # If an absolute path is provided and it exists, use it directly
+            # (file lives on the shared media volume, no copy needed)
+            if os.path.isabs(filename) and os.path.exists(filename):
+                safe = os.path.basename(filename)
+                update_config(job_id, {
+                    "original_filename": safe,
+                    "input_filename":    safe,
+                    "input_filepath":    filename,   # full absolute path
+                })
+            else:
+                # Filename only — look in uploads folder (legacy / upload flow)
+                # Use the original filename as-is (don't sanitize — arr filenames
+                # contain brackets/spaces that secure_filename would strip)
+                safe = os.path.basename(filename)
+                file_path = os.path.join(UPLOAD_FOLDER, safe)
+                # Prevent path traversal
+                if not os.path.realpath(file_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+                    return _error("Invalid file path", 400, job_id)
+                if not os.path.exists(file_path):
+                    return _error(f"File not found in uploads: {safe}", 404, job_id)
+                update_config(job_id, {
+                    "original_filename": safe,
+                    "input_filename":    safe,
+                })
         else:
             config = get_config(job_id)
             if not config or not config.get("input_filename"):
