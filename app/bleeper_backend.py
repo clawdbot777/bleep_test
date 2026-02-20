@@ -1163,20 +1163,30 @@ def cleanup_job_files(job_id: str) -> str:
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
-        f"{job_id}_*",
+        f"{job_id}_*",           # config + any job-tagged files
         f"{base}_center*.*",
         f"{base}_audio*.*",
-        f"{base}_norm.*",
+        f"{base}_norm*.*",
         f"{base}_*redacted*.*",
         f"{base}_*normalized*.*",
         f"{base}_*final*.*",
+        f"{base}*.json",         # whisperX transcript
+        f"{base}*.srt",          # raw + redacted SRT
+        f"{base}*.ac3",          # normalized + extracted audio
+        f"{base}*.dts",
+        f"{base}*.aac",
+        f"{base}*.flac",
+        f"{base}*.wav",
     ]
+    removed = []
     for pattern in patterns:
         for f in glob.glob(os.path.join(UPLOAD_FOLDER, pattern)):
-            if os.path.isfile(f) and f != dest_path:
+            if os.path.isfile(f) and os.path.abspath(f) != os.path.abspath(dest_path):
                 os.remove(f)
-                logger.debug(f"Removed: {f}")
+                removed.append(os.path.basename(f))
 
+    if removed:
+        logger.info(f"Cleanup removed {len(removed)} temp files: {', '.join(removed)}")
     logger.info(f"Cleanup done for job {job_id}.")
     return dest_path
 
