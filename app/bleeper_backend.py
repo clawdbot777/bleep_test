@@ -189,6 +189,26 @@ def _probe(path: str) -> dict:
 # Section 3 – Job config persistence
 # ---------------------------------------------------------------------------
 
+def find_job_by_filename(filename: str) -> dict | None:
+    """
+    Look for an existing incomplete job for the given filename.
+    Returns the config dict if found and not yet completed, else None.
+    """
+    basename = os.path.basename(filename)
+    for config_file in glob.glob(os.path.join(UPLOAD_FOLDER, "*_config.json")):
+        try:
+            with open(config_file) as f:
+                config = json.load(f)
+            if (config.get("original_filename") == basename or
+                    config.get("input_filepath") == filename):
+                status = config.get("pipeline_status", "")
+                if status not in ("completed",):
+                    return config
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
 def get_config(job_id: str) -> dict | None:
     config_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_config.json")
     if not os.path.exists(config_path):
@@ -1119,24 +1139,61 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
         update_config(job_id, {"pipeline_status": status, "pipeline_stage": stage})
         logger.info(f"[pipeline:{job_id}] {stage} → {status}")
 
+    def _already_done(stage: str) -> bool:
+        """Return True if this stage already completed in a prior run."""
+        config = get_config(job_id) or {}
+        completed = config.get("completed_stages", [])
+        return stage in completed
+
+    def _mark_done(stage: str) -> None:
+        config = get_config(job_id) or {}
+        completed = config.get("completed_stages", [])
+        if stage not in completed:
+            completed.append(stage)
+        update_config(job_id, {"completed_stages": completed})
+
     try:
-        _update("running", "analyze_audio")
-        analyze_and_select_audio_stream(job_id)
+        if not _already_done("analyze_audio"):
+            _update("running", "analyze_audio")
+            analyze_and_select_audio_stream(job_id)
+            _mark_done("analyze_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] analyze_audio → skipped (already done)")
 
-        _update("running", "normalize_audio")
-        normalize_audio_stream(job_id)
+        if not _already_done("normalize_audio"):
+            _update("running", "normalize_audio")
+            normalize_audio_stream(job_id)
+            _mark_done("normalize_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] normalize_audio → skipped (already done)")
 
-        _update("running", "extract_audio")
-        extract_audio_stream(job_id)
+        if not _already_done("extract_audio"):
+            _update("running", "extract_audio")
+            extract_audio_stream(job_id)
+            _mark_done("extract_audio")
+        else:
+            logger.info(f"[pipeline:{job_id}] extract_audio → skipped (already done)")
 
-        _update("running", "transcribe")
-        transcribe_audio(job_id, whisperx_settings)
+        if not _already_done("transcribe"):
+            _update("running", "transcribe")
+            transcribe_audio(job_id, whisperx_settings)
+            _mark_done("transcribe")
+        else:
+            logger.info(f"[pipeline:{job_id}] transcribe → skipped (already done)")
 
-        _update("running", "redact")
-        redact_audio(job_id)
+        if not _already_done("redact"):
+            _update("running", "redact")
+            redact_audio(job_id)
+            _mark_done("redact")
+        else:
+            logger.info(f"[pipeline:{job_id}] redact → skipped (already done)")
 
-        _update("running", "combine")
-        combine_media_file(job_id)
+        if not _already_done("combine"):
+            _update("running", "combine")
+            combine_media_file(job_id)
+            _mark_done("combine")
+        else:
+            logger.info(f"[pipeline:{job_id}] combine → skipped (already done)")
 
         _update("running", "cleanup")
         cleanup_job_files(job_id)
@@ -1415,8 +1472,17 @@ def api_process_full():
         job_id   = data.get("job_id")
         filename = data.get("filename")
 
-        # Create job if not supplied
-        if not job_id:
+        # Resume existing incomplete job for this filename if one exists
+        if filename and not job_id:
+            existing = find_job_by_filename(filename)
+            if existing:
+                job_id = existing["job_id"]
+                last_stage = existing.get("pipeline_stage", "")
+                logger.info(f"Resuming existing job {job_id} for {os.path.basename(filename)} (last stage: {last_stage})")
+            else:
+                job_id = str(uuid.uuid4())
+                update_config(job_id, {"job_id": job_id})
+        elif not job_id:
             job_id = str(uuid.uuid4())
             update_config(job_id, {"job_id": job_id})
 
