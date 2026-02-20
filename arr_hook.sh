@@ -9,6 +9,11 @@
 
 BLEEPER_URL="http://bleeper:5000"
 
+# Plex integration — leave empty to skip library refresh
+PLEX_URL=""
+PLEX_TOKEN=""
+PLEX_SECTION_ID="1,2"
+
 # ── Detect arr type and get file path ────────────────────────────────────────
 if [ -n "$radarr_eventtype" ]; then
     EVENT="$radarr_eventtype"
@@ -34,11 +39,22 @@ fi
 
 echo "[bleeper] Submitting: $FILE_PATH"
 
+# ── Build JSON payload ────────────────────────────────────────────────────────
+PAYLOAD=$(cat <<EOF
+{
+  "filename": "$FILE_PATH",
+  "plex_url": "$PLEX_URL",
+  "plex_token": "$PLEX_TOKEN",
+  "plex_section_id": "$PLEX_SECTION_ID"
+}
+EOF
+)
+
 # ── POST to bleeper API ───────────────────────────────────────────────────────
 RESPONSE=$(curl -s -w "\n%{http_code}" \
     -X POST "$BLEEPER_URL/api/process_full" \
     -H "Content-Type: application/json" \
-    -d "{\"filename\": \"$FILE_PATH\"}" \
+    -d "$PAYLOAD" \
     --connect-timeout 10 \
     --max-time 30)
 
@@ -47,7 +63,8 @@ BODY=$(echo "$RESPONSE" | head -1)
 
 if [ "$HTTP_CODE" = "202" ]; then
     JOB_ID=$(echo "$BODY" | grep -o '"job_id":"[^"]*"' | cut -d'"' -f4)
-    echo "[bleeper] Queued OK - job_id: $JOB_ID"
+    POSITION=$(echo "$BODY" | grep -o '"position":[0-9]*' | cut -d':' -f2)
+    echo "[bleeper] Queued OK - job_id: $JOB_ID (position: $POSITION)"
     exit 0
 else
     echo "[bleeper] Failed - HTTP $HTTP_CODE: $BODY"
