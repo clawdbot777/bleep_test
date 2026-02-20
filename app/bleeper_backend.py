@@ -1148,8 +1148,18 @@ def cleanup_job_files(job_id: str) -> str:
         if not os.path.realpath(dest_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
             raise ValueError("original_filename path escapes upload folder.")
 
-    os.replace(final_path, dest_path)
-    logger.info(f"Moved {final_output} → {dest_path}")
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    try:
+        os.replace(final_path, dest_path)
+        logger.info(f"Moved (same device) {final_output} → {dest_path}")
+    except OSError as e:
+        if e.errno == 18:  # cross-device link — fall back to copy + delete
+            logger.info(f"Cross-device move detected, copying {final_output} → {dest_path}")
+            shutil.copy2(final_path, dest_path)
+            os.remove(final_path)
+            logger.info(f"Copy complete, removed source {final_path}")
+        else:
+            raise
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
