@@ -1079,8 +1079,10 @@ def cleanup_job_files(job_id: str) -> str:
     if not final_output:
         raise ValueError("final_output not set in config – nothing to clean up.")
 
-    # Sanitize filenames to prevent path traversal
-    safe_original = secure_filename(original_filename) if original_filename else None
+    # Use original filename as-is — secure_filename strips { } [ ] which
+    # are valid in arr-generated filenames. Path traversal is prevented
+    # by the realpath check below.
+    safe_original = os.path.basename(original_filename) if original_filename else None
     if not safe_original:
         raise ValueError("original_filename is missing or invalid in config.")
 
