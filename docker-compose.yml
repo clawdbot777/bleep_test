@@ -1,0 +1,93 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bleeper – docker-compose
+#
+# Usage:
+#   cp .env.example .env   # fill in your values
+#   docker compose up -d
+#
+# GPU passthrough requires:
+#   - nvidia-container-toolkit installed on the host
+#   - Unraid: Community Applications → "GPU Statistics" or "nvidia-driver" plugin
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  bleeper:
+    build: .
+    image: bleeper:latest
+    container_name: bleeper
+    restart: unless-stopped
+
+    # ── GPU ──────────────────────────────────────────────────────────────────
+    # Remove / comment out if you don't have a GPU – it'll fall back to CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      # Bleeper staging folder (inside the container – mapped below)
+      BLEEPER_UPLOAD: /app/uploads
+
+      # Drop-folder watcher (optional – only if you run watcher.py)
+      WATCH_FOLDER: /media/incoming
+
+      # Plex integration (leave empty to skip library refresh)
+      PLEX_URL: ${PLEX_URL:-}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
+      PLEX_SECTION_ID: ${PLEX_SECTION_ID:-1}
+
+      # whisperX defaults (override as needed)
+      # WHISPERX_MODEL: large-v3
+      # WHISPERX_LANGUAGE: en
+      # WHISPERX_BATCH_SIZE: "20"
+      # WHISPERX_COMPUTE_TYPE: float16
+
+    volumes:
+      # Staging area: bleeper writes temp files here during processing
+      - bleeper_uploads:/app/uploads
+
+      # Your media library: must match the paths Radarr/Sonarr/Plex use.
+      # Adjust to your actual mount points.
+      - /mnt/user/media:/media         # Unraid example
+      # - /media/nas/media:/media      # generic Linux example
+
+    # Optional: share the network with your arr stack so arr_hook.py
+    # can reach bleeper at http://bleeper:5000 by container name.
+    networks:
+      - arr_net
+
+  # ── Optional: drop-folder watcher ─────────────────────────────────────────
+  # Uncomment to run the folder watcher as a sidecar.
+  # watcher:
+  #   build: .
+  #   image: bleeper:latest
+  #   container_name: bleeper_watcher
+  #   restart: unless-stopped
+  #   command: ["python", "watcher.py"]
+  #   environment:
+  #     BLEEPER_URL: http://bleeper:5000
+  #     BLEEPER_UPLOAD: /app/uploads
+  #     WATCH_FOLDER: /media/incoming
+  #   volumes:
+  #     - bleeper_uploads:/app/uploads
+  #     - /mnt/user/media:/media
+  #   networks:
+  #     - arr_net
+  #   depends_on:
+  #     - bleeper
+
+volumes:
+  bleeper_uploads:
+
+networks:
+  arr_net:
+    # If your arr stack is already on a named Docker network, reference it here:
+    # external: true
+    # name: arr_network
+    driver: bridge

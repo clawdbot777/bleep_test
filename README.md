@@ -57,27 +57,71 @@ POST /api/process_full
 
 Returns immediately with a `job_id`.  Poll `/api/job_status/<job_id>` for progress.
 
-## Installation
+## Deployment
+
+### Docker (recommended)
+
+The easiest way to run Bleeper — all dependencies (ffmpeg, CUDA, whisperX) are baked into the image.
+
+**Requirements on the host:**
+- Docker + docker compose
+- NVIDIA GPU + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for GPU acceleration (optional — falls back to CPU)
+- Unraid: install the **nvidia-driver** plugin via Community Applications
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/jakezp/bleep_test.git
+cd bleep_test
+
+# 2. Configure
+cp .env.example .env
+# edit .env – fill in PLEX_URL, PLEX_TOKEN, PLEX_SECTION_ID
+
+# 3. Build and start
+docker compose up -d --build
+
+# 4. Check it's running
+curl http://localhost:5000/api/list_files
+```
+
+**Key volume mounts** (edit `docker-compose.yml` to match your paths):
+
+| Container path | Purpose |
+|---|---|
+| `/app/uploads` | Staging area – bleeper reads/writes temp files here |
+| `/media` | Your media library – must match the paths Radarr/Sonarr/Plex use |
+
+> **Unraid note:** set media volume to `/mnt/user/media:/media` (or wherever your share lives).
+
+#### No GPU? CPU-only mode
+
+Comment out the `deploy.resources` block in `docker-compose.yml` and set:
+```yaml
+environment:
+  WHISPERX_COMPUTE_TYPE: int8
+```
+Transcription will be slower but fully functional.
+
+---
+
+### Manual Installation
 
 ```bash
 pip install -r requirements.txt
+# Also requires: ffmpeg + ffprobe in PATH, Python 3.11+
 ```
 
-### Dependencies
-- Python 3.11+
-- ffmpeg + ffprobe (in PATH)
-- whisperX (`pip install whisperx`)
-- CUDA-capable GPU recommended for whisperX transcription
-
-## Running
+### Running (manual)
 
 ```bash
 # Development
 python run.py
 
 # Production (single worker – required for in-process job tracking)
-gunicorn -w 1 -b 0.0.0.0:5000 run:app
+gunicorn -w 1 -b 0.0.0.0:5000 --timeout 600 run:app
 ```
+
+---
 
 ## Arr Stack Integration
 
@@ -88,13 +132,17 @@ gunicorn -w 1 -b 0.0.0.0:5000 run:app
 3. Events: ✅ On Import, ✅ On Upgrade
 
 ```bash
-# Configure in arr_hook.py or via environment variables:
-export BLEEPER_URL="http://bleeper:5000"
-export BLEEPER_UPLOAD="/tmp/uploads"
+# Configure via environment variables (or edit the CONFIG block in arr_hook.py):
+export BLEEPER_URL="http://bleeper:5000"      # use container name if on same Docker network
+export BLEEPER_UPLOAD="/app/uploads"           # must match the container's upload volume
 export PLEX_URL="http://plex:32400"
 export PLEX_TOKEN="your_plex_token"
 export PLEX_SECTION_ID="1"
 ```
+
+> **Tip:** If Radarr/Sonarr run in Docker on the same `arr_net` network as bleeper, use `http://bleeper:5000` as the URL — no IP needed.
+
+> **Unraid:** add arr_hook.py as a Custom Script under Settings → Connect in each *arr app.  The script is self-contained (just needs `requests` installed on the host, or run it inside a container that shares the network).
 
 ### Manual / Drop Folder
 
