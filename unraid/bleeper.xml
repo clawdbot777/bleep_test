@@ -20,7 +20,7 @@
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
-  <Requires>NVIDIA GPU recommended (falls back to CPU). Requires nvidia-driver Unraid plugin for GPU passthrough.</Requires>
+  <Requires>NVIDIA GPU recommended for amd64 (falls back to CPU). arm64 image uses CPU-only PyTorch automatically. Requires nvidia-driver Unraid plugin for GPU passthrough on amd64.</Requires>
 
   <!-- ── Ports ─────────────────────────────────────────────────────────── -->
   <Config
