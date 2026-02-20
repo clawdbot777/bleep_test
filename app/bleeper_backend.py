@@ -393,6 +393,23 @@ def _extract_center_channel(input_path: str, codec: str, bit_rate: int,
     return center_file, center_path
 
 
+def _extract_loudnorm_json(output: str) -> dict | None:
+    """
+    Robustly extract the loudnorm JSON block from ffmpeg stderr.
+    Filenames may contain { } (e.g. {tmdb-1214931}) so we can't just
+    use find('{') — scan all blocks for one containing 'input_i'.
+    """
+    import re
+    for match in re.finditer(r'\{[^{}]+\}', output, re.DOTALL):
+        try:
+            candidate = json.loads(match.group())
+            if "input_i" in candidate:
+                return candidate
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _measure_loudness(audio_path: str) -> float:
     """Return integrated loudness (input_i) of an audio file using loudnorm."""
     cmd = [
@@ -404,30 +421,10 @@ def _measure_loudness(audio_path: str) -> float:
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stderr or result.stdout
 
-    # ffmpeg filenames may contain { } so find the loudnorm JSON block
-    # specifically — it starts after the last '[Parsed_loudnorm' line
-    # and contains "input_i" as a key.
-    j_start = output.rfind('{\n')
-    if j_start == -1:
-        j_start = output.rfind('{')
-    j_end = output.find('}', j_start) + 1
-    if j_start == -1 or j_end == 0:
+    info = _extract_loudnorm_json(output)
+    if not info:
         raise ValueError("No JSON from loudnorm – cannot measure loudness.")
-    try:
-        info = json.loads(output[j_start:j_end])
-    except json.JSONDecodeError:
-        # Fallback: scan all { } blocks for one containing input_i
-        import re
-        for match in re.finditer(r'\{[^{}]+\}', output, re.DOTALL):
-            try:
-                candidate = json.loads(match.group())
-                if "input_i" in candidate:
-                    info = candidate
-                    break
-            except json.JSONDecodeError:
-                continue
-        else:
-            raise ValueError("Could not parse loudnorm JSON from ffmpeg output.")
+    # Remove the old fallback regex block that was here
 
     input_i = info.get("input_i")
     if input_i is None:
@@ -751,11 +748,10 @@ def normalize_center_audio(modified_file: str, bitrate=None, sample_rate=None,
     ]
     result = subprocess.run(measure_cmd, capture_output=True, text=True)
     output = result.stderr or result.stdout
-    j_start = output.find("{")
-    j_end   = output.rfind("}") + 1
 
-    if j_start != -1 and j_end > j_start:
-        measured = json.loads(output[j_start:j_end])
+    # Use same robust JSON extraction as _measure_loudness
+    measured = _extract_loudnorm_json(output)
+    if measured:
         measured_i     = float(measured.get("input_i", -24.0))
         measured_lra   = float(measured.get("input_lra", 7.0))
         measured_tp    = float(measured.get("input_tp", -2.0))
