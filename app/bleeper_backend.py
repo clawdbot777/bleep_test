@@ -70,7 +70,7 @@ def _get_job_status(job_id: str) -> str:
     with _job_status_lock:
         return job_status.get(job_id, "unknown")
 
-UPLOAD_FOLDER    = "/tmp/uploads"
+UPLOAD_FOLDER    = os.environ.get("BLEEPER_UPLOAD", "/app/uploads")
 TEMP_FOLDER      = "/tmp/uploads/tmp"
 PROCESSED_FOLDER = "/tmp/uploads/processed"
 FILTER_LIST_PATH = os.path.join(os.path.dirname(__file__), "filter_list.txt")
