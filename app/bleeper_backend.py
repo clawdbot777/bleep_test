@@ -56,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Job state tracker  {job_id: 'pending'|'running'|'completed'|'failed'}
+# Job state tracker  {job_id: 'queued'|'running'|'completed'|'failed'}
 _job_status_lock = threading.Lock()
 job_status: dict[str, str] = {}
 
@@ -69,6 +69,47 @@ def _set_job_status(job_id: str, status: str) -> None:
 def _get_job_status(job_id: str) -> str:
     with _job_status_lock:
         return job_status.get(job_id, "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Single-worker pipeline queue — ensures jobs run one at a time so the GPU
+# isn't hammered by concurrent whisperX/ffmpeg processes.
+# ---------------------------------------------------------------------------
+import queue as _queue
+
+_pipeline_queue: _queue.Queue = _queue.Queue()
+_pipeline_queue_order: list = []   # track position for status reporting
+_pipeline_queue_lock = threading.Lock()
+
+
+def _pipeline_worker() -> None:
+    """Single background worker that drains the pipeline queue."""
+    while True:
+        job_id, fn, args = _pipeline_queue.get()
+        with _pipeline_queue_lock:
+            if job_id in _pipeline_queue_order:
+                _pipeline_queue_order.remove(job_id)
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.error(f"[queue] Unhandled error for job {job_id}: {e}")
+        finally:
+            _pipeline_queue.task_done()
+
+
+def _queue_pipeline(job_id: str, fn, args: tuple) -> int:
+    """Enqueue a pipeline job. Returns queue position (1 = next up)."""
+    with _pipeline_queue_lock:
+        _pipeline_queue_order.append(job_id)
+        position = len(_pipeline_queue_order)
+    _pipeline_queue.put((job_id, fn, args))
+    return position
+
+
+# Start the single worker thread (daemon so it dies with the process)
+_worker_thread = threading.Thread(target=_pipeline_worker, daemon=True)
+_worker_thread.start()
+logger.info("Pipeline queue worker started.")
 
 UPLOAD_FOLDER    = os.environ.get("BLEEPER_UPLOAD", "/app/uploads")
 TEMP_FOLDER      = "/tmp/uploads/tmp"
@@ -1296,11 +1337,16 @@ def get_job_status(job_id: str):
     config = get_config(job_id)
     if not config:
         return _error("Job not found", 404, job_id)
+    with _pipeline_queue_lock:
+        queue_position = (_pipeline_queue_order.index(job_id) + 1
+                          if job_id in _pipeline_queue_order else None)
     return jsonify({
-        "job_id":   job_id,
-        "status":   _get_job_status(job_id) if _get_job_status(job_id) != "unknown" else config.get("pipeline_status", "unknown"),
-        "stage":    config.get("pipeline_stage", ""),
-        "error":    config.get("pipeline_error", ""),
+        "job_id":         job_id,
+        "status":         _get_job_status(job_id) if _get_job_status(job_id) != "unknown" else config.get("pipeline_status", "unknown"),
+        "stage":          config.get("pipeline_stage", ""),
+        "error":          config.get("pipeline_error", ""),
+        "queue_position": queue_position,   # None = running or done, N = waiting
+        "queue_depth":    _pipeline_queue.qsize(),
     })
 
 
@@ -1551,17 +1597,18 @@ def api_process_full():
         plex_token        = data.get("plex_token")
         plex_section_id   = data.get("plex_section_id")
 
-        thread = threading.Thread(
-            target=run_full_pipeline,
-            args=(job_id, whisperx_settings, plex_url, plex_token, plex_section_id),
-            daemon=True,
+        position = _queue_pipeline(
+            job_id,
+            run_full_pipeline,
+            (job_id, whisperx_settings, plex_url, plex_token, plex_section_id),
         )
-        thread.start()
 
+        msg = "Pipeline started." if position == 1 else f"Queued at position {position} — will start after current job finishes."
         return jsonify({
-            "status":  "queued",
-            "job_id":  job_id,
-            "message": "Pipeline started. Poll /api/job_status/<job_id> for progress.",
+            "status":   "queued",
+            "job_id":   job_id,
+            "position": position,
+            "message":  f"{msg} Poll /api/job_status/<job_id> for progress.",
         }), 202
 
     except Exception as e:
