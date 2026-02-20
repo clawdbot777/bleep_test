@@ -1127,20 +1127,23 @@ def cleanup_job_files(job_id: str) -> str:
     if not safe_original:
         raise ValueError("original_filename is missing or invalid in config.")
 
-    final_path    = os.path.join(UPLOAD_FOLDER, final_output)
-    original_path = os.path.join(UPLOAD_FOLDER, safe_original)
-
-    # Verify paths stay within UPLOAD_FOLDER
-    if not os.path.realpath(final_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-        raise ValueError("final_output path escapes upload folder.")
-    if not os.path.realpath(original_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
-        raise ValueError("original_filename path escapes upload folder.")
-
+    final_path = os.path.join(UPLOAD_FOLDER, final_output)
     if not os.path.exists(final_path):
         raise FileNotFoundError(f"Final output not found: {final_path}")
 
-    os.rename(final_path, original_path)
-    logger.info(f"Renamed {final_output} → {original_filename}")
+    # If the file came from an absolute path on the media volume,
+    # move the output back there (overwrite original with bleeped version).
+    # Otherwise fall back to placing it in the uploads folder.
+    input_filepath = config.get("input_filepath")
+    if input_filepath:
+        dest_path = input_filepath
+    else:
+        dest_path = os.path.join(UPLOAD_FOLDER, safe_original)
+        if not os.path.realpath(dest_path).startswith(os.path.realpath(UPLOAD_FOLDER)):
+            raise ValueError("original_filename path escapes upload folder.")
+
+    os.replace(final_path, dest_path)
+    logger.info(f"Moved {final_output} → {dest_path}")
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
@@ -1154,12 +1157,12 @@ def cleanup_job_files(job_id: str) -> str:
     ]
     for pattern in patterns:
         for f in glob.glob(os.path.join(UPLOAD_FOLDER, pattern)):
-            if os.path.isfile(f) and f != original_path:
+            if os.path.isfile(f) and f != dest_path:
                 os.remove(f)
                 logger.debug(f"Removed: {f}")
 
     logger.info(f"Cleanup done for job {job_id}.")
-    return original_filename
+    return dest_path
 
 
 # ---------------------------------------------------------------------------
