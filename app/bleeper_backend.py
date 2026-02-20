@@ -1145,7 +1145,29 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
         """Return True if this stage already completed in a prior run."""
         config = get_config(job_id) or {}
         completed = config.get("completed_stages", [])
-        return stage in completed
+        if stage in completed:
+            return True
+        # Fallback: check if the expected output file already exists
+        file_checks = {
+            "analyze_audio":  lambda c: c.get("audio_stream_index_nr") is not None,
+            "normalize_audio": lambda c: c.get("normalization_skipped") or (
+                c.get("normalized_audio_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("normalized_audio_file", "")))),
+            "extract_audio":  lambda c: c.get("center_channel_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("center_channel_file", ""))),
+            "transcribe":     lambda c: c.get("srt_file") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("srt_file", ""))),
+            "redact":         lambda c: c.get("redacted_srt") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("redacted_srt", ""))),
+            "combine":        lambda c: c.get("final_output") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("final_output", ""))),
+        }
+        check = file_checks.get(stage)
+        if check and check(config):
+            logger.info(f"[pipeline:{job_id}] {stage} → output exists, marking done")
+            _mark_done(stage)
+            return True
+        return False
 
     def _mark_done(stage: str) -> None:
         config = get_config(job_id) or {}
