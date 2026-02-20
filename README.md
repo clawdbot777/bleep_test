@@ -8,20 +8,22 @@ Automatically removes profanity from movies and TV shows: mutes/bleeps the audio
 Sonarr/Radarr
      │ On Import event
      ▼
-arr_hook.py  ──────────────────────┐
+arr_hook.sh ───────────────────────┐
                                    │
+manual_bleeper.sh (manual) ────────┤
 watcher.py (drop folder)  ─────────┤
                                    ▼
                           POST /api/process_full
                                    │
                     ┌──────────────▼──────────────┐
                     │       Bleeper Flask API       │
+                    │    (single-worker queue)      │
                     │                               │
-                    │  1. analyze_and_select_audio  │
-                    │  2. normalize_audio (→ AC3 5.1│
-                    │  3. extract_audio + FC channel│
+                    │  1. analyze & select audio    │
+                    │  2. normalize → AC3 5.1       │
+                    │  3. extract FC channel        │
                     │  4. whisperX transcribe       │
-                    │  5. redact audio + subtitles  │
+                    │  5. redact audio + subs       │
                     │  6. combine into MKV          │
                     │  7. cleanup temp files        │
                     └──────────────┬──────────────┘
@@ -36,40 +38,48 @@ watcher.py (drop folder)  ─────────┤
 | Stage | Endpoint | Description |
 |-------|----------|-------------|
 | 1 | `/api/analyze_and_select_audio` | Probe file; pick best audio stream (AC3 > DTS > TrueHD > EAC3, prefers English multichannel) |
-| 2 | `/api/normalize_audio` | **Optional** – transcode any codec → AC3 5.1 to eliminate edge-cases downstream |
+| 2 | `/api/normalize_audio` | Transcode any codec → AC3 5.1 — eliminates codec edge-cases downstream |
 | 3 | `/api/extract_audio` | Extract selected stream + isolate center (FC) channel |
 | 4 | `/api/transcribe` | whisperX STT → word-level timestamps (JSON + SRT) |
 | 5 | `/api/redact` | Mute profanity + insert 800Hz bleep; redact subtitle text |
-| 6 | `/api/combine_media` | Rebuild MKV: Family audio + Original audio + Redacted subs |
-| 7 | `/api/cleanup` | Remove temp files; rename output to original filename |
+| 6 | `/api/combine_media` | Rebuild MKV: Family audio (default) + Original audio + kept subs + Redacted SRT |
+| 7 | `/api/cleanup` | Move output back to original media path; remove all temp files |
+
+### Job queue
+
+Jobs run **one at a time** — the pipeline uses a single-worker queue so the GPU is never shared between concurrent transcription jobs. Submit as many as you like; each waits its turn.
+
+### Resume / retry
+
+If a job fails mid-pipeline, resubmitting the same file resumes from the failed stage — completed stages are skipped. Cleanup deletes the config on success so the next run always starts fresh.
 
 ### Fire-and-forget
 
 ```
 POST /api/process_full
 {
-  "filename": "movie.mkv",
+  "filename": "/data/media/movies/Film (2024)/Film (2024).mkv",
   "plex_url": "http://plex:32400",
   "plex_token": "YOUR_TOKEN",
-  "plex_section_id": "1"
+  "plex_section_id": "1,2"
 }
 ```
 
-Returns immediately with a `job_id`.  Poll `/api/job_status/<job_id>` for progress.
+Returns HTTP 202 immediately with a `job_id` and queue `position`. Poll `/api/job_status/<job_id>` for progress.
 
 ## Deployment
 
 ### Docker (recommended)
 
-The easiest way to run Bleeper — all dependencies (ffmpeg, CUDA, whisperX) are baked into the image.
+All dependencies (ffmpeg, CUDA, whisperX, Python) are baked into the image.
 
-**Requirements on the host:**
+**Requirements:**
 - Docker + docker compose
 - NVIDIA GPU + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for GPU acceleration (optional — falls back to CPU)
 - Unraid: install the **nvidia-driver** plugin via Community Applications
 
 ```bash
-# 1. Clone the repo
+# 1. Clone
 git clone https://github.com/jakezp/bleep_test.git
 cd bleep_test
 
@@ -77,49 +87,43 @@ cd bleep_test
 cp .env.example .env
 # edit .env – fill in PLEX_URL, PLEX_TOKEN, PLEX_SECTION_ID
 
-# 3. Build and start
+# 3. Start
 docker compose up -d --build
 
-# 4. Check it's running
+# 4. Verify
 curl http://localhost:5000/api/list_files
 ```
 
-**Key volume mounts** (edit `docker-compose.yml` to match your paths):
+**Volume mounts** (edit `docker-compose.yml`):
 
-| Container path | Purpose |
-|---|---|
-| `/app/uploads` | Staging area – bleeper reads/writes temp files here |
-| `/media` | Your media library – must match the paths Radarr/Sonarr/Plex use |
+| Host path | Container path | Purpose |
+|---|---|---|
+| `/mnt/user/appdata/bleeper/uploads` | `/app/uploads` | Staging area for temp files (use cache pool) |
+| `/mnt/user/media` | `/data/media` | Media library — matches arr stack convention |
 
-> **Unraid note:** set media volume to `/mnt/user/media:/media` (or wherever your share lives).
+> The container uses `/data/media` to match the standard arr stack path convention. No path translation needed between Radarr/Sonarr and Bleeper.
 
 #### No GPU? CPU-only mode
 
-Comment out the `deploy.resources` block in `docker-compose.yml` and set:
+Remove the `deploy.resources` block in `docker-compose.yml` and set:
 ```yaml
 environment:
   WHISPERX_COMPUTE_TYPE: int8
 ```
-Transcription will be slower but fully functional.
 
 ---
 
-### Manual Installation
+### Unraid template
+
+One-command import:
 
 ```bash
-pip install -r requirements.txt
-# Also requires: ffmpeg + ffprobe in PATH, Python 3.11+
+mkdir -p /boot/config/plugins/dockerMan/templates-user
+curl -o /boot/config/plugins/dockerMan/templates-user/bleeper.xml \
+  https://raw.githubusercontent.com/jakezp/bleep_test/main/unraid/bleeper.xml
 ```
 
-### Running (manual)
-
-```bash
-# Development
-python run.py
-
-# Production (single worker – required for in-process job tracking)
-gunicorn -w 1 -b 0.0.0.0:5000 --timeout 600 run:app
-```
+Then Docker tab → **Add Container** → select `bleeper` from the template dropdown.
 
 ---
 
@@ -128,32 +132,36 @@ gunicorn -w 1 -b 0.0.0.0:5000 --timeout 600 run:app
 ### Radarr / Sonarr
 
 1. **Settings → Connect → Custom Script**
-2. Script path: `/opt/bleeper/arr_hook.py`
+2. Script path: `/path/to/arr_hook.sh`
 3. Events: ✅ On Import, ✅ On Upgrade
 
-```bash
-# Configure via environment variables (or edit the CONFIG block in arr_hook.py):
-export BLEEPER_URL="http://bleeper:5000"      # use container name if on same Docker network
-export BLEEPER_UPLOAD="/app/uploads"           # must match the container's upload volume
-export PLEX_URL="http://plex:32400"
-export PLEX_TOKEN="your_plex_token"
-export PLEX_SECTION_ID="1"
+Edit the config block at the top of `arr_hook.sh`:
+
+```sh
+BLEEPER_URL="http://bleeper:5000"   # container name if on same Docker network
+PLEX_URL="http://plex:32400"
+PLEX_TOKEN="your_plex_token"
+PLEX_SECTION_ID="1,2"               # comma-separated, or empty = refresh all
 ```
 
-> **Tip:** If Radarr/Sonarr run in Docker on the same `arr_net` network as bleeper, use `http://bleeper:5000` as the URL — no IP needed.
+> **Tip:** `arr_hook.sh` uses `curl` only — no Python needed. Works in any arr container out of the box.
 
-> **Unraid:** add arr_hook.py as a Custom Script under Settings → Connect in each *arr app.  The script is self-contained (just needs `requests` installed on the host, or run it inside a container that shares the network).
-
-### Manual / Drop Folder
+### Manual submission
 
 ```bash
-# Watch a folder and auto-submit new videos:
-export WATCH_FOLDER="/media/incoming"
-python watcher.py
-
-# Or submit a single file manually:
-python arr_hook.py --file /path/to/movie.mkv
+# Tab-complete the path — no quotes needed
+/data/plugin/manual_bleeper.sh /data/media/movies/Film\ \(2024\)/Film\ \(2024\).mkv
 ```
+
+`manual_bleeper.sh` extracts the movie title from the parent directory and delegates to `arr_hook.sh`, so Plex config is shared.
+
+### Drop folder watcher
+
+```bash
+WATCH_FOLDER=/data/media/incoming python watcher.py
+```
+
+---
 
 ## Configuration
 
@@ -161,106 +169,104 @@ Key settings in `app/bleeper_backend.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NORMALIZE_TARGET_CODEC` | `"ac3"` | Target codec for normalization. Set to `None` to skip. |
+| `UPLOAD_FOLDER` | `$BLEEPER_UPLOAD` / `/app/uploads` | Staging area for temp files |
+| `NORMALIZE_TARGET_CODEC` | `"ac3"` | Target codec. Set to `None` to skip normalization. |
 | `NORMALIZE_TARGET_CHANNELS` | `6` | Target channel count (6 = 5.1) |
-| `NORMALIZE_TARGET_BITRATE` | `"640k"` | Target bitrate |
+| `NORMALIZE_TARGET_BITRATE` | `"640k"` | Target audio bitrate |
 | `FILTER_LIST_PATH` | `app/filter_list.txt` | Path to profanity word list |
 
+---
+
 ## API Reference
+
+### `POST /api/process_full`
+Run the entire pipeline in one call (fire-and-forget).
+```json
+{
+  "filename": "/data/media/movies/Film (2024)/Film (2024).mkv",
+  "whisperx_settings": {
+    "model": "large-v3",
+    "language": "en",
+    "batch_size": 16,
+    "compute_type": "float16"
+  },
+  "plex_url": "http://plex:32400",
+  "plex_token": "abc123",
+  "plex_section_id": "1,2"
+}
+```
+Returns HTTP 202:
+```json
+{
+  "status": "queued",
+  "job_id": "...",
+  "position": 1,
+  "message": "Pipeline started. Poll /api/job_status/<job_id> for progress."
+}
+```
+
+### `GET /api/job_status/<job_id>`
+Poll pipeline progress.
+```json
+{
+  "job_id": "...",
+  "status": "running",
+  "stage": "transcribe",
+  "error": "",
+  "queue_position": null,
+  "queue_depth": 2
+}
+```
+`queue_position`: `null` = currently running or done; `N` = waiting in queue.
+
+Status values: `queued` → `running` → `completed` | `failed`
 
 ### `POST /api/initialize_job`
 Create a new job. Returns `{"job_id": "..."}`.
 
 ### `POST /api/select_remote_file`
-Associate a file already in the upload folder with a job.
+Associate a file with a job.
 ```json
-{"job_id": "...", "filename": "movie.mkv"}
+{"job_id": "...", "filename": "/data/media/movies/Film (2024)/Film (2024).mkv"}
 ```
 
 ### `POST /api/upload`
 Upload a file (multipart/form-data). Fields: `file`, `job_id`.
 
 ### `POST /api/analyze_and_select_audio`
-Probe the input and select the best audio stream.
-```json
-{"job_id": "..."}
-```
+Probe and select best audio stream. `{"job_id": "..."}`
 
 ### `POST /api/normalize_audio`
-Transcode selected stream to normalized codec/layout.
-```json
-{"job_id": "...", "force": false}
-```
+Transcode to AC3 5.1. `{"job_id": "...", "force": false}`
 
 ### `POST /api/extract_audio`
-Extract audio stream and center (FC) channel.
-```json
-{"job_id": "..."}
-```
+Extract FC channel. `{"job_id": "..."}`
 
 ### `POST /api/transcribe`
-Run whisperX on the center channel.
-```json
-{
-  "job_id": "...",
-  "whisperx_settings": {
-    "model": "large-v3",
-    "language": "en",
-    "batch_size": 20,
-    "compute_type": "float16"
-  }
-}
-```
+Run whisperX. `{"job_id": "..."}`
 
 ### `POST /api/redact`
-Mute profanity + redact subtitles.
-```json
-{"job_id": "..."}
-```
+Mute + bleep profanity. `{"job_id": "..."}`
 
 ### `POST /api/combine_media`
-Rebuild the final MKV.
-```json
-{"job_id": "..."}
-```
+Rebuild MKV. `{"job_id": "..."}`
 
 ### `POST /api/cleanup`
-Remove temp files and rename output.
-```json
-{"job_id": "..."}
-```
-
-### `POST /api/process_full`
-Run the entire pipeline in one call.
-```json
-{
-  "filename": "movie.mkv",
-  "whisperx_settings": {...},
-  "plex_url": "http://plex:32400",
-  "plex_token": "...",
-  "plex_section_id": "1"
-}
-```
-Returns HTTP 202 immediately:
-```json
-{"status": "queued", "job_id": "...", "message": "Pipeline started. Poll /api/job_status/<job_id> for progress."}
-```
-
-### `GET /api/job_status/<job_id>`
-Poll pipeline progress.
-```json
-{"job_id": "...", "status": "running", "stage": "transcribe", "error": ""}
-```
-
-Status values: `initialized` → `queued` → `running` → `completed` | `failed`
+Move output to original path, remove temp files. `{"job_id": "..."}`
 
 ### `GET /api/list_files`
-List video files in the upload folder.
+List video files in the upload staging folder.
+
+---
 
 ## Output
 
-The final MKV contains:
-- **Video**: original, untouched (stream copy)
-- **Audio Track 1** (default): "Family audio" – profanity muted/bleeped, normalized
-- **Audio Track 2**: "Original audio" – untouched original
-- **Subtitle Track** (default): Redacted subtitles (profanity replaced with `***`)
+The final MKV replaces the original file in-place and contains:
+
+| Stream | Default | Description |
+|---|---|---|
+| Video | — | Original, untouched (stream copy) |
+| Audio 1 | ✅ | **Family audio** – profanity muted/bleeped, AC3 5.1 |
+| Audio 2 | ❌ | **Original audio** – untouched |
+| Subtitles (existing) | ❌ | Original SRT/PGS/ASS streams copied as-is (`mov_text` stripped) |
+| Subtitles (redacted) | ✅ | **Redacted subtitles** – profanity replaced with `***` |
