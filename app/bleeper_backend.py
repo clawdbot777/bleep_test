@@ -1126,14 +1126,25 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
         logger.info(f"[pipeline:{job_id}] ✅ Pipeline completed successfully.")
 
         # Optional Plex refresh
-        if plex_url and plex_token and plex_section_id:
+        # plex_section_id can be a single ID ("1"), comma-separated ("1,2"),
+        # or empty/None to refresh all sections.
+        if plex_url and plex_token:
             try:
-                refresh_url = (
-                    f"{plex_url.rstrip('/')}/library/sections/{plex_section_id}/refresh"
-                    f"?X-Plex-Token={plex_token}"
-                )
-                resp = requests.get(refresh_url, timeout=10)
-                logger.info(f"Plex refresh → HTTP {resp.status_code}")
+                base = plex_url.rstrip('/')
+                token_param = f"?X-Plex-Token={plex_token}"
+                if plex_section_id:
+                    section_ids = [s.strip() for s in str(plex_section_id).split(",") if s.strip()]
+                else:
+                    section_ids = []
+
+                if section_ids:
+                    for sid in section_ids:
+                        resp = requests.get(f"{base}/library/sections/{sid}/refresh{token_param}", timeout=10)
+                        logger.info(f"Plex refresh section {sid} → HTTP {resp.status_code}")
+                else:
+                    # Refresh all sections
+                    resp = requests.get(f"{base}/library/sections/all/refresh{token_param}", timeout=10)
+                    logger.info(f"Plex refresh all sections → HTTP {resp.status_code}")
             except Exception as plex_err:
                 logger.warning(f"Plex refresh failed (non-fatal): {plex_err}")
 
