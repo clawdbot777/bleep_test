@@ -5,8 +5,12 @@ requests>=2.31.0
 watchdog>=4.0.0
 gunicorn>=21.2.0
 
-# torch, torchaudio, and nemo_toolkit are managed explicitly in Dockerfile
-# to ensure CUDA builds always win. Do NOT add them here.
+# torch and torchaudio are managed explicitly in Dockerfile (CUDA builds).
+# Do NOT add them here.
 
-# Optional: WhisperX fallback backend
-# pip install whisperx>=3.1.1
+# Transcription backends (default: faster_whisper)
+faster-whisper>=1.0.0
+
+# Optional backends:
+# pip install whisperx>=3.1.1          # whisperx backend
+# pip install nemo_toolkit[asr]>=2.2.0  # parakeet backend

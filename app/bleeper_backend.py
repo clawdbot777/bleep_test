@@ -639,12 +639,14 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
         raise FileNotFoundError(f"Center channel file not found: {input_path}")
 
     ws      = whisperx_settings or {}
-    backend = ws.get("backend", "parakeet")   # "parakeet" | "whisperx"
+    backend = ws.get("backend", "faster_whisper")   # "faster_whisper" | "whisperx" | "parakeet"
 
     if backend == "parakeet":
         _transcribe_parakeet(job_id, input_path, input_file, ws)
-    else:
+    elif backend == "whisperx":
         _transcribe_whisperx(job_id, input_path, input_file, ws)
+    else:
+        _transcribe_faster_whisper(job_id, input_path, input_file, ws)
 
     return True
 
@@ -706,6 +708,41 @@ def _transcribe_parakeet(job_id: str, input_path: str, input_file: str,
         "transcription_backend": "parakeet",
     })
     logger.info(f"Parakeet transcription complete → {json_file}, {srt_file}")
+
+
+def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
+                                ws: dict) -> None:
+    """Transcribe using faster-whisper (CTranslate2-accelerated Whisper)."""
+    model        = ws.get("model", "large-v3")
+    device       = ws.get("device", "cuda" if CUDA_AVAILABLE else "cpu")
+    compute_type = ws.get("compute_type", "float16" if CUDA_AVAILABLE else "int8")
+    language     = ws.get("language")    # None = auto-detect
+    beam_size    = ws.get("beam_size", 5)
+    script       = os.path.join(os.path.dirname(__file__), "faster_whisper_transcribe.py")
+
+    cmd = [
+        sys.executable, script,
+        input_path,
+        "--output_dir",   UPLOAD_FOLDER,
+        "--model",        model,
+        "--device",       device,
+        "--compute_type", compute_type,
+        "--beam_size",    str(beam_size),
+    ]
+    if language:
+        cmd += ["--language", language]
+
+    _run(cmd, step="faster_whisper_transcribe")
+
+    base      = os.path.splitext(input_file)[0]
+    json_file = f"{base}.json"
+    srt_file  = f"{base}.srt"
+    update_config(job_id, {
+        "transcription_json":    json_file,
+        "transcription_srt":     srt_file,
+        "transcription_backend": "faster_whisper",
+    })
+    logger.info(f"faster-whisper transcription complete → {json_file}, {srt_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -1708,17 +1745,20 @@ def api_process_full():
     {
         "job_id":           "<existing job_id>",   // if omitted, a new job is created
         "filename":         "movie.mkv",           // required if no job_id pre-loaded
-        "whisperx_settings": {          // transcription settings
-            "backend":      "parakeet", // "parakeet" (default) | "whisperx"
-            // --- parakeet-specific ---
-            "model": "nvidia/parakeet-tdt-0.6b-v3",
-            // --- whisperx-specific (install whisperx separately to use) ---
-            // "model":        "large-v3",
-            // "align_model":  "WAV2VEC2_ASR_LARGE_LV60K_960H",
-            // "batch_size":   20,
-            // "compute_type": "float16",
-            // "device":       "cuda",
-            // "language":     "en",
+        "whisperx_settings": {              // transcription settings
+            "backend":      "faster_whisper", // "faster_whisper" (default) | "whisperx" | "parakeet"
+            // --- faster_whisper / whisperx shared ---
+            "model":        "large-v3",
+            "device":       "cuda",
+            "compute_type": "float16",        // float16 (GPU) or int8 (CPU)
+            "language":     "en",             // omit for auto-detect
+            // --- faster_whisper only ---
+            "beam_size": 5,
+            // --- whisperx only ---
+            // "align_model": "WAV2VEC2_ASR_LARGE_LV60K_960H",
+            // "batch_size":  20,
+            // --- parakeet only (requires nemo_toolkit[asr]) ---
+            // "model": "nvidia/parakeet-tdt-0.6b-v3",
         },
         "plex_url":         "http://plex:32400",
         "plex_token":       "abc123",

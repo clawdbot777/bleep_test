@@ -35,11 +35,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir \
     torch==2.4.1 torchaudio==2.4.1 \
     --index-url https://download.pytorch.org/whl/cu121 \
- && pip install --no-cache-dir nemo_toolkit[asr] \
- && pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir \
-    torch==2.4.1 torchaudio==2.4.1 \
-    --index-url https://download.pytorch.org/whl/cu121
+ && pip install --no-cache-dir faster-whisper \
+ && pip install --no-cache-dir -r requirements.txt
 
 # ── App ───────────────────────────────────────────────────────────────────────
 WORKDIR /app
