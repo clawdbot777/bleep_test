@@ -1097,7 +1097,8 @@ def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: in
         for i, ch in enumerate(channels)
     )
     filter_str = (
-        f"[{original_input_index}:a][{fc_input_index}:a]"
+        f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
+        f"[{original_input_index}:a][fc_mono]"
         f"amerge=inputs=2[merged];"
         f"[merged]pan={layout}|{channel_map}[final]"
     )
@@ -1220,8 +1221,15 @@ def combine_media_file(job_id: str) -> str:
     if sample_rate: cmd += ["-ar", str(sample_rate)]
 
     cmd += ["-c:a:1", "copy"]
-    cmd += ["-c:s", "copy"]                          # copy all kept subs as-is
-    cmd += [f"-c:s:{redacted_sub_idx}", "srt"]       # force srt for redacted track
+
+    # MP4/MOV containers only support mov_text subtitles — subrip/srt will error.
+    # MKV and others accept srt/copy directly.
+    mp4_container = os.path.splitext(output_path)[1].lower() in (".mp4", ".m4v", ".mov")
+    sub_codec_copy     = "mov_text" if mp4_container else "copy"
+    sub_codec_redacted = "mov_text" if mp4_container else "srt"
+
+    cmd += ["-c:s", sub_codec_copy]
+    cmd += [f"-c:s:{redacted_sub_idx}", sub_codec_redacted]
 
     cmd += [
         "-metadata:s:a:0", "title=Family audio",
