@@ -183,6 +183,14 @@ CHANNEL_LAYOUTS: dict[str, list[str]] = {
 FC_CAPABLE_LAYOUTS = {k for k, v in CHANNEL_LAYOUTS.items() if "FC" in v}
 
 # ---------------------------------------------------------------------------
+# Bleep tone configuration — tune these to taste
+# ---------------------------------------------------------------------------
+
+BLEEP_FREQUENCY     = 1000      # Hz — 1 kHz is the standard broadcast bleep tone
+BLEEP_VOLUME        = 0.5       # 0.0–1.0 — relative to center-channel level
+BLEEP_FADE_DURATION = 0.025     # seconds — smooth ramp in/out at bleep edges (25 ms)
+
+# ---------------------------------------------------------------------------
 # Section 2 – Helper utilities
 # ---------------------------------------------------------------------------
 
@@ -674,7 +682,13 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
                                    pad_before: float = 0.10,
                                    pad_after:  float = 0.10) -> list[dict]:
     """Return list of {start, end} dicts for each profane word."""
-    clean_profanity = {w.lower().strip(string.punctuation) for w in profanity}
+    # Clean profanity list the same way audio words are cleaned: strip ALL
+    # punctuation (not just edges) so entries like "Christ's" or "face-fucks"
+    # match the de-punctuated form whisperX produces ("christs", "facefucks").
+    clean_profanity = {
+        "".join(c for c in w.lower() if c not in string.punctuation)
+        for w in profanity
+    }
     hits = []
     for segment in timestamps_data.get("segments", []):
         words = segment.get("words", [])
@@ -691,9 +705,13 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
                         f"{segment.get('start'):.2f}-{segment.get('end'):.2f} "
                         f"— using segment bounds as fallback."
                     )
+                    # Don't add pad_after to segment["end"] — the segment end
+                    # already includes natural duration and trailing silence.
+                    # Extra padding here would cause the bleep to spill well
+                    # beyond the actual word.
                     hits.append({
                         "start": max(0.0, float(segment["start"]) - pad_before),
-                        "end":   float(segment["end"]) + pad_after,
+                        "end":   float(segment["end"]),
                     })
                     continue
 
@@ -740,28 +758,72 @@ def get_non_profanity_intervals(profanity_ts: list[dict], duration: float) -> li
     return clean
 
 
-def _build_ffmpeg_filter(profanity_ts: list[dict], clean_intervals: list[dict],
-                          duration: float) -> str:
-    """Build an ffmpeg filter_complex that mutes profanity and inserts a 800Hz bleep."""
-    mute_cond  = "+".join(f"between(t,{b['start']},{b['end']})" for b in profanity_ts)
-    mute_filter = f"[0]volume=0:enable='{mute_cond}'[main]"
+def _smooth_mute_envelope(profanity_ts: list[dict], fade: float) -> str:
+    """
+    Build a per-frame ffmpeg volume expression for the main audio (1 = full, 0 = muted).
+    Smoothly ramps from 1 → 0 at each bleep start and 0 → 1 at each bleep end,
+    giving a natural fade rather than a hard cut.
+    Segments must be non-overlapping (call after merging).
+    """
+    if not profanity_ts:
+        return "1"
+    parts = []
+    for b in profanity_ts:
+        s, e = b["start"], b["end"]
+        f  = min(fade, (e - s) / 4)   # cap at 25 % of segment so fade fits
+        sf = s + f
+        ef = max(sf, e - f)            # guard against tiny segments
+        # Each segment contributes a dip envelope (0 outside, ramps 0→1 inside)
+        parts.append(
+            f"if(between(t,{s:.4f},{sf:.4f}),(t-{s:.4f})/{f:.4f},"
+            f"if(between(t,{sf:.4f},{ef:.4f}),1,"
+            f"if(between(t,{ef:.4f},{e:.4f}),({e:.4f}-t)/{f:.4f},0)))"
+        )
+    # mute factor = 1 − sum(dips); segments are non-overlapping so sum ≤ 1
+    return f"1-({'+'.join(parts)})"
 
-    # Build bleep enable condition (inverse of mute)
-    bleep_parts = []
-    for seg in clean_intervals[:-1]:
-        bleep_parts.append(f"between(t,{seg['start']},{seg['end']})")
-    if clean_intervals:
-        last = clean_intervals[-1]
-        if abs(last["end"] - duration) < 0.01:
-            bleep_parts.append(f"gte(t,{last['start']})")
-        else:
-            bleep_parts.append(f"between(t,{last['start']},{last['end']})")
-    bleep_off_cond = "+".join(bleep_parts) if bleep_parts else "0"
 
+def _smooth_bleep_envelope(profanity_ts: list[dict], peak: float, fade: float) -> str:
+    """
+    Build a per-frame ffmpeg volume expression for the bleep tone.
+    Ramps 0 → peak over `fade` s at start, holds, then ramps peak → 0 at end.
+    """
+    if not profanity_ts:
+        return "0"
+    parts = []
+    for b in profanity_ts:
+        s, e = b["start"], b["end"]
+        f  = min(fade, (e - s) / 4)
+        sf = s + f
+        ef = max(sf, e - f)
+        parts.append(
+            f"if(between(t,{s:.4f},{sf:.4f}),(t-{s:.4f})/{f:.4f}*{peak},"
+            f"if(between(t,{sf:.4f},{ef:.4f}),{peak},"
+            f"if(between(t,{ef:.4f},{e:.4f}),({e:.4f}-t)/{f:.4f}*{peak},0)))"
+        )
+    return "+".join(parts)
+
+
+def _build_ffmpeg_filter(profanity_ts: list[dict],
+                          duration: float,
+                          bleep_freq: int   = BLEEP_FREQUENCY,
+                          bleep_vol: float  = BLEEP_VOLUME,
+                          fade: float       = BLEEP_FADE_DURATION) -> str:
+    """
+    Build an ffmpeg filter_complex that:
+      - Smoothly mutes the center channel around each profanity window
+      - Mixes in a configurable sine tone that ramps in/out at each boundary
+    The smooth envelopes (25 ms default) eliminate the abrupt hard-cut artefact.
+    """
+    mute_expr  = _smooth_mute_envelope(profanity_ts, fade)
+    bleep_expr = _smooth_bleep_envelope(profanity_ts, bleep_vol, fade)
+
+    mute_filter  = f"[0]volume='{mute_expr}':eval=frame[main]"
     bleep_filter = (
-        f"sine=f=800,volume=0.4,"
-        f"aformat=channel_layouts=mono,"
-        f"volume=0:enable='{bleep_off_cond}'[beep]"
+        f"sine=f={bleep_freq},"
+        f"volume='{bleep_expr}':eval=frame,"
+        f"aformat=channel_layouts=mono"
+        f"[beep]"
     )
     amix = "[main][beep]amix=inputs=2:duration=first"
     return ";".join([mute_filter, bleep_filter, amix])
@@ -866,8 +928,7 @@ def normalize_center_audio(modified_file: str, bitrate=None, sample_rate=None,
                f"measured_LRA={measured_lra:.2f}:"
                f"measured_TP={measured_tp:.2f}:"
                f"measured_thresh={measured_thresh:.2f}:"
-               f"linear=true:print_format=summary,"
-               "volume=0.90"
+               f"linear=true:print_format=summary"
            )]
     )
     if bitrate:     cmd += ["-b:a", str(bitrate)]
@@ -879,7 +940,9 @@ def normalize_center_audio(modified_file: str, bitrate=None, sample_rate=None,
     return norm_out_file
 
 
-def redact_audio(job_id: str) -> str:
+def redact_audio(job_id: str,
+                  pad_before: float = 0.10,
+                  pad_after:  float = 0.10) -> str:
     config = get_config(job_id)
     if not config:
         raise ValueError(f"Config not found for job_id: {job_id}")
@@ -906,7 +969,9 @@ def redact_audio(job_id: str) -> str:
     with open(json_path) as f:
         ts_data = json.load(f)
 
-    profanity_ts   = identify_profanity_timestamps(ts_data, profanity)
+    profanity_ts   = identify_profanity_timestamps(ts_data, profanity,
+                                                    pad_before=pad_before,
+                                                    pad_after=pad_after)
     duration       = ts_data["segments"][-1]["end"] if ts_data.get("segments") else 0.0
 
     # Redact SRT (always — even if no profanity, produce the _redacted copy)
@@ -931,7 +996,7 @@ def redact_audio(job_id: str) -> str:
         return "Redaction completed successfully (no profanity)"
 
     clean_intervals = get_non_profanity_intervals(profanity_ts, duration)
-    filter_complex  = _build_ffmpeg_filter(profanity_ts, clean_intervals, duration)
+    filter_complex  = _build_ffmpeg_filter(profanity_ts, duration)
 
     # Apply bleep filter to center channel
     modified_center = apply_complex_filter_to_audio(
@@ -1225,6 +1290,8 @@ def cleanup_job_files(job_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
+                       pad_before: float = 0.10,
+                       pad_after:  float = 0.10,
                        plex_url: str | None = None,
                        plex_token: str | None = None,
                        plex_section_id: str | None = None) -> None:
@@ -1306,7 +1373,7 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
 
         if not _already_done("redact"):
             _update("running", "redact")
-            redact_audio(job_id)
+            redact_audio(job_id, pad_before=pad_before, pad_after=pad_after)
             _mark_done("redact")
         else:
             logger.info(f"[pipeline:{job_id}] redact → skipped (already done)")
@@ -1548,8 +1615,11 @@ def api_transcribe():
 def api_redact():
     try:
         job_id = _job_id_from_request()
+        data   = request.get_json(silent=True) or {}
+        pad_before = float(data.get("pad_before", 0.10))
+        pad_after  = float(data.get("pad_after",  0.10))
         _require_config(job_id)
-        redact_audio(job_id)
+        redact_audio(job_id, pad_before=pad_before, pad_after=pad_after)
         return jsonify({"status": "success"})
     except Exception as e:
         return _error(str(e), 500, details=traceback.format_exc())
@@ -1651,6 +1721,8 @@ def api_process_full():
                 )
 
         whisperx_settings = data.get("whisperx_settings")
+        pad_before        = float(data.get("pad_before", 0.10))
+        pad_after         = float(data.get("pad_after",  0.10))
         plex_url          = data.get("plex_url")
         plex_token        = data.get("plex_token")
         plex_section_id   = data.get("plex_section_id")
@@ -1658,7 +1730,7 @@ def api_process_full():
         position = _queue_pipeline(
             job_id,
             run_full_pipeline,
-            (job_id, whisperx_settings, plex_url, plex_token, plex_section_id),
+            (job_id, whisperx_settings, pad_before, pad_after, plex_url, plex_token, plex_section_id),
         )
 
         msg = "Pipeline started." if position == 1 else f"Queued at position {position} — will start after current job finishes."
