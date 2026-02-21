@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Bleeper – Automated Profanity Filter Pipeline
-# Base: NVIDIA CUDA 12.1 + Python 3.11 (GPU-accelerated whisperX)
+# Base: NVIDIA CUDA 12.1 + Python 3.11 (GPU-accelerated Parakeet TDT / NeMo)
 #
 # Build:
 #   docker build -t bleeper .
@@ -35,7 +35,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir \
     torch==2.3.0 torchaudio==2.3.0 \
     --index-url https://download.pytorch.org/whl/cu121 \
- && pip install --no-cache-dir whisperx>=3.1.1 \
+ && pip install --no-cache-dir nemo_toolkit[asr] \
  && pip install --no-cache-dir -r requirements.txt
 
 # ── App ───────────────────────────────────────────────────────────────────────

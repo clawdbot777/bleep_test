@@ -638,7 +638,7 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
         raise FileNotFoundError(f"Center channel file not found: {input_path}")
 
     ws      = whisperx_settings or {}
-    backend = ws.get("backend", "whisperx")   # "whisperx" | "parakeet"
+    backend = ws.get("backend", "parakeet")   # "parakeet" | "whisperx"
 
     if backend == "parakeet":
         _transcribe_parakeet(job_id, input_path, input_file, ws)
@@ -1700,16 +1700,16 @@ def api_process_full():
         "job_id":           "<existing job_id>",   // if omitted, a new job is created
         "filename":         "movie.mkv",           // required if no job_id pre-loaded
         "whisperx_settings": {          // transcription settings
-            "backend":      "whisperx",  // "whisperx" (default) | "parakeet"
-            // --- whisperx-specific ---
-            "model":        "large-v3",
-            "align_model":  "WAV2VEC2_ASR_LARGE_LV60K_960H",
-            "batch_size":   20,
-            "compute_type": "float16",
-            "device":       "cuda",
-            "language":     "en",
+            "backend":      "parakeet", // "parakeet" (default) | "whisperx"
             // --- parakeet-specific ---
-            // "model": "nvidia/parakeet-tdt-0.6b-v3"
+            "model": "nvidia/parakeet-tdt-0.6b-v3",
+            // --- whisperx-specific (install whisperx separately to use) ---
+            // "model":        "large-v3",
+            // "align_model":  "WAV2VEC2_ASR_LARGE_LV60K_960H",
+            // "batch_size":   20,
+            // "compute_type": "float16",
+            // "device":       "cuda",
+            // "language":     "en",
         },
         "plex_url":         "http://plex:32400",
         "plex_token":       "abc123",

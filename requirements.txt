@@ -5,9 +5,9 @@ requests>=2.31.0
 watchdog>=4.0.0
 gunicorn>=21.2.0
 torch>=2.2.0
-whisperx>=3.1.1
 
-# Optional: Parakeet TDT backend (faster, native word timestamps, no separate alignment model)
-# Uncomment or install manually to enable whisperx_settings.backend = "parakeet"
-# nemo_toolkit[asr]>=2.2.0
+# Parakeet TDT — primary transcription backend (installed via Dockerfile)
+nemo_toolkit[asr]>=2.2.0
 
+# Optional: WhisperX fallback backend
+# pip install whisperx>=3.1.1
