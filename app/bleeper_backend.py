@@ -637,7 +637,20 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Center channel file not found: {input_path}")
 
-    ws = whisperx_settings or {}
+    ws      = whisperx_settings or {}
+    backend = ws.get("backend", "whisperx")   # "whisperx" | "parakeet"
+
+    if backend == "parakeet":
+        _transcribe_parakeet(job_id, input_path, input_file, ws)
+    else:
+        _transcribe_whisperx(job_id, input_path, input_file, ws)
+
+    return True
+
+
+def _transcribe_whisperx(job_id: str, input_path: str, input_file: str,
+                          ws: dict) -> None:
+    """Transcribe using whisperx CLI (original backend)."""
     device       = ws.get("device", "cuda" if CUDA_AVAILABLE else "cpu")
     language     = ws.get("language", "en")
     batch_size   = ws.get("batch_size", 20)
@@ -662,11 +675,36 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
     json_file = f"{base}.json"
     srt_file  = f"{base}.srt"
     update_config(job_id, {
-        "transcription_json": json_file,
-        "transcription_srt":  srt_file,
+        "transcription_json":    json_file,
+        "transcription_srt":     srt_file,
+        "transcription_backend": "whisperx",
     })
-    logger.info(f"Transcription complete → {json_file}, {srt_file}")
-    return True
+    logger.info(f"WhisperX transcription complete → {json_file}, {srt_file}")
+
+
+def _transcribe_parakeet(job_id: str, input_path: str, input_file: str,
+                          ws: dict) -> None:
+    """Transcribe using NVIDIA Parakeet TDT via parakeet_transcribe.py."""
+    model  = ws.get("model", "nvidia/parakeet-tdt-0.6b-v3")
+    script = os.path.join(os.path.dirname(__file__), "parakeet_transcribe.py")
+
+    cmd = [
+        sys.executable, script,
+        input_path,
+        "--output_dir", UPLOAD_FOLDER,
+        "--model",      model,
+    ]
+    _run(cmd, step="parakeet_transcribe")
+
+    base      = os.path.splitext(input_file)[0]
+    json_file = f"{base}.json"
+    srt_file  = f"{base}.srt"
+    update_config(job_id, {
+        "transcription_json":    json_file,
+        "transcription_srt":     srt_file,
+        "transcription_backend": "parakeet",
+    })
+    logger.info(f"Parakeet transcription complete → {json_file}, {srt_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -1661,7 +1699,18 @@ def api_process_full():
     {
         "job_id":           "<existing job_id>",   // if omitted, a new job is created
         "filename":         "movie.mkv",           // required if no job_id pre-loaded
-        "whisperx_settings": { ... },
+        "whisperx_settings": {          // transcription settings
+            "backend":      "whisperx",  // "whisperx" (default) | "parakeet"
+            // --- whisperx-specific ---
+            "model":        "large-v3",
+            "align_model":  "WAV2VEC2_ASR_LARGE_LV60K_960H",
+            "batch_size":   20,
+            "compute_type": "float16",
+            "device":       "cuda",
+            "language":     "en",
+            // --- parakeet-specific ---
+            // "model": "nvidia/parakeet-tdt-0.6b-v3"
+        },
         "plex_url":         "http://plex:32400",
         "plex_token":       "abc123",
         "plex_section_id":  "1"
