@@ -33,12 +33,12 @@ ENV PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir \
-    torch==2.3.0 torchaudio==2.3.0 \
+    torch==2.4.1 torchaudio==2.4.1 \
     --index-url https://download.pytorch.org/whl/cu121 \
  && pip install --no-cache-dir nemo_toolkit[asr] \
  && pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir \
-    torch==2.3.0 torchaudio==2.3.0 \
+    torch==2.4.1 torchaudio==2.4.1 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # ── App ───────────────────────────────────────────────────────────────────────
