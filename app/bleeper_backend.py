@@ -1045,7 +1045,6 @@ def combine_media_file(job_id: str) -> str:
 
     # Build sub map args — only kept subtitle streams
     sub_map_args = [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-    sub_map_args += ["-map", "2:s"]   # placeholder; overridden per-command for multichannel
 
     if channels <= 2:
         cmd = (
@@ -1255,8 +1254,8 @@ def run_full_pipeline(job_id: str, whisperx_settings: dict | None = None,
                 os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("normalized_audio_file", "")))),
             "extract_audio":  lambda c: c.get("center_channel_file") and
                 os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("center_channel_file", ""))),
-            "transcribe":     lambda c: c.get("srt_file") and
-                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("srt_file", ""))),
+            "transcribe":     lambda c: c.get("transcription_srt") and
+                os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("transcription_srt", ""))),
             "redact":         lambda c: c.get("redacted_srt") and
                 os.path.exists(os.path.join(UPLOAD_FOLDER, c.get("redacted_srt", ""))),
             "combine":        lambda c: c.get("final_output") and
