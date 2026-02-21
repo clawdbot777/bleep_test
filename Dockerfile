@@ -36,10 +36,10 @@ RUN pip install --no-cache-dir \
     torch==2.3.0 torchaudio==2.3.0 \
     --index-url https://download.pytorch.org/whl/cu121 \
  && pip install --no-cache-dir nemo_toolkit[asr] \
+ && pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir \
     torch==2.3.0 torchaudio==2.3.0 \
-    --index-url https://download.pytorch.org/whl/cu121 \
- && pip install --no-cache-dir -r requirements.txt
+    --index-url https://download.pytorch.org/whl/cu121
 
 # ── App ───────────────────────────────────────────────────────────────────────
 WORKDIR /app
