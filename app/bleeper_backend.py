@@ -677,19 +677,49 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
     clean_profanity = {w.lower().strip(string.punctuation) for w in profanity}
     hits = []
     for segment in timestamps_data.get("segments", []):
-        for word in segment.get("words", []):
+        words = segment.get("words", [])
+        for i, word in enumerate(words):
             raw = word.get("word", "")
             clean = "".join(c for c in raw.lower() if c not in string.punctuation)
             if clean in clean_profanity:
+                # Bug fix 1a: handle missing word-level timestamps (fast/overlapping speech).
+                # WhisperX sometimes omits start/end on individual words — fall back to
+                # segment bounds rather than crashing or silently skipping the word.
+                if "start" not in word or "end" not in word:
+                    logger.warning(
+                        f"Missing timestamps for word '{raw}' in segment "
+                        f"{segment.get('start'):.2f}-{segment.get('end'):.2f} "
+                        f"— using segment bounds as fallback."
+                    )
+                    hits.append({
+                        "start": max(0.0, float(segment["start"]) - pad_before),
+                        "end":   float(segment["end"]) + pad_after,
+                    })
+                    continue
+
+                raw_end = float(word["end"])
+
+                # Bug fix 2: cap end time to prevent beep bleeding into post-word silence.
+                # WhisperX often sets the last word's end = segment end (which includes
+                # trailing silence). Cap to a generous max single-word duration (1.2s)
+                # and to the start of the next word when available.
+                max_word_duration = 1.2
+                capped_end = min(raw_end, float(word["start"]) + max_word_duration)
+                if i + 1 < len(words) and "start" in words[i + 1]:
+                    capped_end = min(capped_end, float(words[i + 1]["start"]) - 0.05)
+
                 hits.append({
-                    "start": max(0.0, word["start"] - pad_before),
-                    "end":   word["end"] + pad_after,
+                    "start": max(0.0, float(word["start"]) - pad_before),
+                    "end":   capped_end + pad_after,
                 })
-    # Merge overlapping intervals
+
+    # Merge overlapping intervals — and also merge near-adjacent ones (< 0.15s gap).
+    # Bug fix 1b: without this, two rapid consecutive swear words produce a tiny gap
+    # in the mute window, letting a sliver of original audio bleed through.
     hits.sort(key=lambda x: x["start"])
     merged = []
     for h in hits:
-        if merged and h["start"] <= merged[-1]["end"]:
+        if merged and h["start"] - merged[-1]["end"] < 0.15:
             merged[-1]["end"] = max(merged[-1]["end"], h["end"])
         else:
             merged.append(dict(h))
