@@ -512,15 +512,17 @@ def extract_audio_stream(job_id: str) -> dict:
     # Use normalized file if available, otherwise use original input
     norm_file = config.get("normalized_audio_file")
     if norm_file and not config.get("normalization_skipped"):
-        source_file  = norm_file
-        stream_index = 0         # normalized file has only one audio stream
-        source_codec = config.get("normalized_codec", NORMALIZE_TARGET_CODEC)
+        source_file   = norm_file
+        stream_index  = 0         # normalized file has only one audio stream
+        source_codec  = config.get("normalized_codec", NORMALIZE_TARGET_CODEC)
         source_layout = config.get("normalized_layout", NORMALIZE_TARGET_LAYOUT)
+        source_path   = os.path.join(UPLOAD_FOLDER, source_file)
     else:
-        source_file  = config.get("input_filename")
-        stream_index = index_nr
-
-    source_path = os.path.join(UPLOAD_FOLDER, source_file)
+        source_file   = config.get("input_filename")
+        stream_index  = index_nr
+        # Respect input_filepath for files on mounted media volumes (e.g. Plex)
+        # — same pattern as analyze_audio_stream and combine_media_file.
+        source_path   = config.get("input_filepath") or os.path.join(UPLOAD_FOLDER, source_file)
     if not os.path.exists(source_path):
         raise FileNotFoundError(f"Source file not found: {source_path}")
 
