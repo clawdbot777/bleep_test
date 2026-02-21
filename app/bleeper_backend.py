@@ -210,13 +210,14 @@ def _hwaccel_flags(video: bool = True) -> list[str]:
 
 
 def _run(cmd: list[str], step: str = "") -> None:
-    """Run a subprocess command; raise RuntimeError with stderr on failure."""
+    """Run a subprocess command; raise RuntimeError with output on failure."""
     label = f"[{step}] " if step else ""
     logger.debug(f"{label}Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"{label}Command failed:\n{result.stderr}")
-        raise RuntimeError(f"{step} failed: {result.stderr[-2000:]}")
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        logger.error(f"{label}Command failed:\n{combined}")
+        raise RuntimeError(f"{step} failed: {combined[-5000:]}")
     return result
 
 
