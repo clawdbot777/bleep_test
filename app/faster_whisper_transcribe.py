@@ -71,14 +71,24 @@ def main() -> None:
     print(f"[faster-whisper] Loading {args.model} on {args.device} ({args.compute_type})", flush=True)
     model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
 
-    print(f"[faster-whisper] Transcribing (batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
-    segments_iter, info = model.transcribe(
-        args.audio,
-        word_timestamps=True,
-        language=args.language,
-        beam_size=args.beam_size,
-        batch_size=args.batch_size,
-    )
+    if args.batch_size > 1:
+        from faster_whisper.transcribe import BatchedInferencePipeline
+        pipeline = BatchedInferencePipeline(model=model)
+        print(f"[faster-whisper] Transcribing (batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
+        segments_iter, info = pipeline.transcribe(
+            args.audio,
+            word_timestamps=True,
+            language=args.language,
+            batch_size=args.batch_size,
+        )
+    else:
+        print(f"[faster-whisper] Transcribing (sequential): {os.path.basename(args.audio)}", flush=True)
+        segments_iter, info = model.transcribe(
+            args.audio,
+            word_timestamps=True,
+            language=args.language,
+            beam_size=args.beam_size,
+        )
 
     print(f"[faster-whisper] Language: {info.language} ({info.language_probability:.0%})", flush=True)
 
