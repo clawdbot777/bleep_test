@@ -275,10 +275,15 @@ def get_config(job_id: str) -> dict | None:
 
 def update_config(job_id: str, updates: dict) -> None:
     config = get_config(job_id) or {"job_id": job_id}
+    if not config.get("job_id"):
+        config["job_id"] = job_id
     config.update(updates)
     config_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_config.json")
-    with open(config_path, "w") as f:
+    # Write atomically: temp file → rename to avoid partial-read corruption
+    tmp_path = config_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp_path, config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +547,10 @@ def extract_audio_stream(job_id: str) -> dict:
     isolate the center channel.  Updates config with all relevant paths.
     """
     config   = get_config(job_id)
+    logger.debug(f"[extract_audio] config keys: {list(config.keys()) if config else 'None'} | "
+                 f"input_filepath={config.get('input_filepath') if config else 'N/A'} | "
+                 f"normalization_skipped={config.get('normalization_skipped') if config else 'N/A'} | "
+                 f"normalized_audio_file={config.get('normalized_audio_file') if config else 'N/A'}")
     index_nr = config.get("audio_stream_index_nr")
 
     # Use normalized file if available, otherwise use original input
@@ -1924,12 +1933,14 @@ def api_process_full():
             # (file lives on the shared media volume, no copy needed)
             if os.path.isabs(filename) and os.path.exists(filename):
                 safe = os.path.basename(filename)
+                logger.debug(f"[process_full] File accessible at full path; input_filepath={filename}")
                 update_config(job_id, {
                     "original_filename": safe,
                     "input_filename":    safe,
                     "input_filepath":    filename,   # full absolute path
                 })
             else:
+                logger.debug(f"[process_full] File NOT found at full path '{filename}'; falling back to uploads")
                 # Filename only — look in uploads folder (legacy / upload flow)
                 # Use the original filename as-is (don't sanitize — arr filenames
                 # contain brackets/spaces that secure_filename would strip)
