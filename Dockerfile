@@ -41,9 +41,10 @@ RUN pip install --no-cache-dir \
 # ── App ───────────────────────────────────────────────────────────────────────
 WORKDIR /app
 COPY . .
-RUN mkdir -p /app/uploads /media
+RUN mkdir -p /app/uploads /app/models /media
 
 ENV BLEEPER_UPLOAD=/app/uploads \
+    MODEL_DIR=/app/models \
     WATCH_FOLDER=/media/incoming \
     PYTHONUNBUFFERED=1
 

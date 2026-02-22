@@ -125,6 +125,8 @@ def main() -> None:
     parser.add_argument("audio",          help="Path to the audio file.")
     parser.add_argument("--output_dir",   default=".", help="Directory for output files.")
     parser.add_argument("--model",        default="large-v3")
+    parser.add_argument("--model_dir",    default=None,
+                        help="Directory to cache downloaded models. Defaults to HuggingFace cache (~/.cache).")
     parser.add_argument("--device",       default="cuda")
     parser.add_argument("--compute_type", default="float16")
     parser.add_argument("--language",     default=None, help="Language code (e.g. en). None = auto-detect.")
@@ -151,7 +153,11 @@ def main() -> None:
         sys.exit(2)
 
     print(f"[faster-whisper] Loading {args.model} on {args.device} ({args.compute_type})", flush=True)
-    model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+    model_kwargs = dict(device=args.device, compute_type=args.compute_type)
+    if args.model_dir:
+        model_kwargs["download_root"] = args.model_dir
+        print(f"[faster-whisper] Model cache dir: {args.model_dir}", flush=True)
+    model = WhisperModel(args.model, **model_kwargs)
 
     if args.batch_size > 1 and not args.vad_filter:
         from faster_whisper.transcribe import BatchedInferencePipeline

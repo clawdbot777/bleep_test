@@ -112,6 +112,7 @@ _worker_thread.start()
 logger.info("Pipeline queue worker started.")
 
 UPLOAD_FOLDER    = os.environ.get("BLEEPER_UPLOAD", "/app/uploads")
+MODEL_DIR        = os.environ.get("MODEL_DIR", "/app/models")
 TEMP_FOLDER      = "/tmp/uploads/tmp"
 PROCESSED_FOLDER = "/tmp/uploads/processed"
 FILTER_LIST_PATH = os.path.join(os.path.dirname(__file__), "filter_list.txt")
@@ -767,6 +768,7 @@ def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
         input_path,
         "--output_dir",            UPLOAD_FOLDER,
         "--model",                 model,
+        "--model_dir",             MODEL_DIR,
         "--device",                device,
         "--compute_type",          compute_type,
         "--beam_size",             str(beam_size),

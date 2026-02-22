@@ -47,6 +47,17 @@
     Mask="false">/mnt/user/appdata/bleeper/uploads</Config>
 
   <Config
+    Name="Model Cache"
+    Target="/app/models"
+    Default="/mnt/user/appdata/bleeper/models"
+    Mode="rw"
+    Description="Directory where faster-whisper downloads and caches models. Persisting this avoids re-downloading the model (large-v3 is ~3GB) every time the container restarts."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/appdata/bleeper/models</Config>
+
+  <Config
     Name="Media Library"
     Target="/data/media"
     Default="/mnt/user/media"
@@ -147,5 +158,16 @@
     Display="advanced"
     Required="true"
     Mask="false">/app/uploads</Config>
+
+  <Config
+    Name="Model Cache Path (internal)"
+    Target="MODEL_DIR"
+    Default="/app/models"
+    Mode=""
+    Description="Internal container path for the model cache volume. Do not change unless you remapped the models volume target."
+    Type="Variable"
+    Display="advanced"
+    Required="true"
+    Mask="false">/app/models</Config>
 
 </Container>

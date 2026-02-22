@@ -34,6 +34,9 @@ services:
       # Bleeper staging folder (inside the container – mapped below)
       BLEEPER_UPLOAD: /app/uploads
 
+      # Model cache – persisted on the host so models survive container restarts
+      MODEL_DIR: /app/models
+
       # Drop-folder watcher (optional – only if you run watcher.py)
       WATCH_FOLDER: /media/incoming
 
@@ -42,15 +45,12 @@ services:
       PLEX_TOKEN: ${PLEX_TOKEN:-}
       PLEX_SECTION_ID: ${PLEX_SECTION_ID:-1}
 
-      # whisperX defaults (override as needed)
-      # WHISPERX_MODEL: large-v3
-      # WHISPERX_LANGUAGE: en
-      # WHISPERX_BATCH_SIZE: "20"
-      # WHISPERX_COMPUTE_TYPE: float16
-
     volumes:
       # Staging area: bleeper writes temp files here during processing
       - bleeper_uploads:/app/uploads
+
+      # Model cache: faster-whisper downloads models here (persisted across restarts)
+      - bleeper_models:/app/models
 
       # Your media library: use /data/media to match arr stack convention
       - /mnt/user/media:/data/media         # Unraid example
@@ -82,6 +82,7 @@ services:
 
 volumes:
   bleeper_uploads:
+  bleeper_models:
 
 networks:
   arr_net:
