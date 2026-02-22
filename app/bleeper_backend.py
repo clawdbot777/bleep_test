@@ -5,7 +5,7 @@ Pipeline stages:
   1. analyze_and_select_audio_stream  - probe & pick best audio stream
   2. normalize_audio_stream           - transcode any codec → AC3 5.1 (optional, configurable)
   3. extract_audio_stream             - extract selected stream + center (FC) channel
-  4. transcribe_audio                 - whisperX STT → JSON + SRT
+  4. transcribe_audio                 - faster-whisper STT → JSON + SRT
   5. redact_audio                     - mute/bleep profanity, redact subtitles
   6. combine_media_file               - rebuild MKV with family + original audio tracks
   7. cleanup_job_files                - remove temp files, rename output to original name
