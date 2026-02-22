@@ -57,6 +57,8 @@ def _split_long_segments(segments: list[dict], max_duration: float) -> list[dict
 
     Word-level timestamps are preserved; each child segment gets the exact
     start/end of its first/last word.
+
+    Words missing start/end timestamps are kept but don't trigger splits.
     """
     out = []
     for seg in segments:
@@ -68,11 +70,22 @@ def _split_long_segments(segments: list[dict], max_duration: float) -> list[dict
             out.append(seg)
             continue
 
+        # Filter to only words that have usable timestamps for split decisions.
+        timed_words = [w for w in words if "start" in w and "end" in w]
+        if not timed_words:
+            out.append(seg)
+            continue
+
         chunk_words: list[dict] = []
-        chunk_start: float      = words[0]["start"]
+        chunk_start: float      = timed_words[0]["start"]
 
         for i, w in enumerate(words):
             chunk_words.append(w)
+
+            # Only measure duration against words that have timestamps.
+            if "end" not in w or "start" not in w:
+                continue
+
             chunk_duration = w["end"] - chunk_start
             is_last        = (i == len(words) - 1)
             at_sentence    = w["word"].rstrip().endswith(tuple(_SENTENCE_END))
@@ -82,15 +95,25 @@ def _split_long_segments(segments: list[dict], max_duration: float) -> list[dict
             if (at_sentence and chunk_duration >= 1.0) or over_limit or is_last:
                 text = " ".join(cw["word"] for cw in chunk_words).strip()
                 if text:
+                    # Find the last word in the chunk that has an end timestamp.
+                    last_timed = next(
+                        (cw for cw in reversed(chunk_words) if "end" in cw), None
+                    )
+                    chunk_end = last_timed["end"] if last_timed else seg["end"]
                     out.append({
                         "start": round(chunk_start, 3),
-                        "end":   round(chunk_words[-1]["end"], 3),
+                        "end":   round(chunk_end, 3),
                         "text":  text,
                         "words": chunk_words,
                     })
                 chunk_words = []
+                # Advance chunk_start to the next word that has a timestamp.
                 if not is_last:
-                    chunk_start = words[i + 1]["start"]
+                    next_timed = next(
+                        (words[j] for j in range(i + 1, len(words)) if "start" in words[j]),
+                        None,
+                    )
+                    chunk_start = next_timed["start"] if next_timed else w["end"]
 
     return out
 
@@ -130,7 +153,7 @@ def main() -> None:
     print(f"[faster-whisper] Loading {args.model} on {args.device} ({args.compute_type})", flush=True)
     model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
 
-    if args.batch_size > 1:
+    if args.batch_size > 1 and not args.vad_filter:
         from faster_whisper.transcribe import BatchedInferencePipeline
         pipeline = BatchedInferencePipeline(model=model)
         print(f"[faster-whisper] Transcribing (batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
@@ -141,6 +164,9 @@ def main() -> None:
             batch_size=args.batch_size,
         )
     else:
+        # vad_filter=True requires sequential mode — BatchedInferencePipeline does not support VAD.
+        if args.vad_filter and args.batch_size > 1:
+            print(f"[faster-whisper] vad_filter=True forces sequential mode (batch ignored).", flush=True)
         print(f"[faster-whisper] Transcribing (sequential, vad={args.vad_filter}): {os.path.basename(args.audio)}", flush=True)
         segments_iter, info = model.transcribe(
             args.audio,

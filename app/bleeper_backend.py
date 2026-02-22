@@ -843,6 +843,31 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
     hits = []
     for segment in timestamps_data.get("segments", []):
         words = segment.get("words", [])
+
+        if not words:
+            # ----------------------------------------------------------------
+            # Fallback: no word-level timestamps for this segment.
+            # BatchedInferencePipeline sometimes returns segments with words=[].
+            # Check if the segment TEXT contains any profanity and cover the
+            # whole segment if so.
+            # ----------------------------------------------------------------
+            seg_text_clean = "".join(
+                c for c in segment.get("text", "").lower()
+                if c not in string.punctuation
+            )
+            for token in seg_text_clean.split():
+                if token in clean_profanity:
+                    logger.warning(
+                        f"Profanity '{token}' found in segment text but no word timestamps "
+                        f"({segment.get('start'):.2f}-{segment.get('end'):.2f}) — covering full segment."
+                    )
+                    hits.append({
+                        "start": max(0.0, float(segment["start"]) - pad_before),
+                        "end":   float(segment["end"]) + pad_after,
+                    })
+                    break  # one hit covers the whole segment; don't add duplicates
+            continue
+
         for i, word in enumerate(words):
             raw = word.get("word", "")
             clean = "".join(c for c in raw.lower() if c not in string.punctuation).strip()
@@ -856,10 +881,6 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
                         f"{segment.get('start'):.2f}-{segment.get('end'):.2f} "
                         f"— using segment bounds as fallback."
                     )
-                    # Don't add pad_after to segment["end"] — the segment end
-                    # already includes natural duration and trailing silence.
-                    # Extra padding here would cause the bleep to spill well
-                    # beyond the actual word.
                     hits.append({
                         "start": max(0.0, float(segment["start"]) - pad_before),
                         "end":   float(segment["end"]),
