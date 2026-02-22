@@ -51,7 +51,7 @@ def main() -> None:
     parser.add_argument("--compute_type", default="float16")
     parser.add_argument("--language",     default=None, help="Language code (e.g. en). None = auto-detect.")
     parser.add_argument("--beam_size",    type=int, default=5)
-    parser.add_argument("--batch_size",   type=int, default=1,
+    parser.add_argument("--batch_size",   type=int, default=16,
                         help="Number of audio chunks processed in parallel.")
     args = parser.parse_args()
 

@@ -718,7 +718,7 @@ def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
     compute_type = ws.get("compute_type", "float16" if CUDA_AVAILABLE else "int8")
     language     = ws.get("language")    # None = auto-detect
     beam_size    = ws.get("beam_size", 5)
-    batch_size   = ws.get("batch_size", 8)
+    batch_size   = ws.get("batch_size", 16)
     script       = os.path.join(os.path.dirname(__file__), "faster_whisper_transcribe.py")
 
     cmd = [
