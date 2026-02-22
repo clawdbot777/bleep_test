@@ -5,7 +5,7 @@ Pipeline stages:
   1. analyze_and_select_audio_stream  - probe & pick best audio stream
   2. normalize_audio_stream           - transcode any codec → AC3 5.1 (optional, configurable)
   3. extract_audio_stream             - extract selected stream + center (FC) channel
-  4. transcribe_audio                 - whisperX STT → JSON + SRT
+  4. transcribe_audio                 - faster-whisper STT → JSON + SRT
   5. redact_audio                     - mute/bleep profanity, redact subtitles
   6. combine_media_file               - rebuild MKV with family + original audio tracks
   7. cleanup_job_files                - remove temp files, rename output to original name
@@ -210,13 +210,14 @@ def _hwaccel_flags(video: bool = True) -> list[str]:
 
 
 def _run(cmd: list[str], step: str = "") -> None:
-    """Run a subprocess command; raise RuntimeError with stderr on failure."""
+    """Run a subprocess command; raise RuntimeError with output on failure."""
     label = f"[{step}] " if step else ""
     logger.debug(f"{label}Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"{label}Command failed:\n{result.stderr}")
-        raise RuntimeError(f"{step} failed: {result.stderr[-2000:]}")
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        logger.error(f"{label}Command failed:\n{combined}")
+        raise RuntimeError(f"{step} failed: {combined[-5000:]}")
     return result
 
 
@@ -462,6 +463,39 @@ def _extract_center_channel(input_path: str, codec: str, bit_rate: int,
     return center_file, center_path
 
 
+def _extract_flr_channel(input_path: str, codec: str, bit_rate: int,
+                          sample_rate: int, base: str) -> tuple[str, str]:
+    """
+    Extract FL + FR channels as a stereo audio file.
+    Returns (flr_filename, flr_path).
+    """
+    if codec == "dts":
+        flr_file       = f"{base}_flr.wav"
+        flr_codec_args = ["-c:a", "pcm_s32le"]
+    else:
+        flr_file       = f"{base}_flr.{codec}"
+        flr_codec_args = []
+
+    flr_path = os.path.join(UPLOAD_FOLDER, flr_file)
+
+    cmd = (
+        ["ffmpeg", "-y"]
+        + _hwaccel_flags(video=False)
+        + ["-i", input_path,
+           "-filter_complex", "[0:a]pan=stereo|c0=FL|c1=FR[flr]",
+           "-map", "[flr]"]
+        + flr_codec_args
+    )
+    if bit_rate:
+        cmd += ["-b:a", str(bit_rate)]
+    if sample_rate:
+        cmd += ["-ar", str(sample_rate)]
+    cmd += ["-strict", "-2", flr_path]
+
+    _run(cmd, step="extract_flr_channel")
+    return flr_file, flr_path
+
+
 def _extract_loudnorm_json(output: str) -> dict | None:
     """
     Robustly extract the loudnorm JSON block from ffmpeg stderr.
@@ -605,18 +639,31 @@ def extract_audio_stream(job_id: str) -> dict:
         center_path  = audio_path
         loudness     = _measure_loudness(center_path)
 
+    # ---- Step E: Extract FL+FR stereo (for surround redaction) ------------
+    flr_file = None
+    if has_fc and "FL" in CHANNEL_LAYOUTS.get(layout, []) and "FR" in CHANNEL_LAYOUTS.get(layout, []):
+        try:
+            flr_file, _ = _extract_flr_channel(
+                audio_path, codec, bit_rate, sample_rate, base
+            )
+            logger.info(f"FL+FR stereo extracted → {flr_file}")
+        except Exception as exc:
+            logger.warning(f"FL+FR extraction failed (non-fatal): {exc}")
+            flr_file = None
+
     update_config(job_id, {
-        "audio_filename":    audio_file,
+        "audio_filename":      audio_file,
         "center_channel_file": center_file,
-        "loudness_info":     loudness,
-        "audio_stream_info": {
+        "flr_channel_file":    flr_file,
+        "loudness_info":       loudness,
+        "audio_stream_info":   {
             "streams": [stream2],
             "format":  info2.get("format", {}),
         },
-        "source_layout":     layout,
-        "source_channels":   channels,
-        "source_codec":      codec,
-        "source_bit_rate":   bit_rate,
+        "source_layout":      layout,
+        "source_channels":    channels,
+        "source_codec":       codec,
+        "source_bit_rate":    bit_rate,
         "source_sample_rate": sample_rate,
     })
     logger.info(f"Center channel extracted → {center_file}  (loudness: {loudness:.1f} LUFS)")
@@ -637,7 +684,34 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Center channel file not found: {input_path}")
 
-    ws = whisperx_settings or {}
+    ws      = whisperx_settings or {}
+    backend = ws.get("backend", "faster_whisper")   # "faster_whisper" | "whisperx"
+
+    _transcribe_faster_whisper(job_id, input_path, input_file, ws) \
+        if backend != "whisperx" \
+        else _transcribe_whisperx(job_id, input_path, input_file, ws)
+
+    # ---- FL+FR pass (faster-whisper only, with VAD) -----------------------
+    if backend != "whisperx":
+        flr_file = config.get("flr_channel_file")
+        if flr_file:
+            flr_path = os.path.join(UPLOAD_FOLDER, flr_file)
+            if os.path.exists(flr_path):
+                logger.info("Transcribing FL+FR channel (VAD-filtered)…")
+                _transcribe_faster_whisper(
+                    job_id, flr_path, flr_file, ws,
+                    vad_filter=True,
+                    config_keys=("flr_transcription_json", "flr_transcription_srt"),
+                )
+            else:
+                logger.warning(f"FL+FR file not found, skipping FL+FR transcription: {flr_path}")
+
+    return True
+
+
+def _transcribe_whisperx(job_id: str, input_path: str, input_file: str,
+                          ws: dict) -> None:
+    """Transcribe using whisperx CLI (original backend)."""
     device       = ws.get("device", "cuda" if CUDA_AVAILABLE else "cpu")
     language     = ws.get("language", "en")
     batch_size   = ws.get("batch_size", 20)
@@ -662,11 +736,61 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
     json_file = f"{base}.json"
     srt_file  = f"{base}.srt"
     update_config(job_id, {
-        "transcription_json": json_file,
-        "transcription_srt":  srt_file,
+        "transcription_json":    json_file,
+        "transcription_srt":     srt_file,
+        "transcription_backend": "whisperx",
     })
-    logger.info(f"Transcription complete → {json_file}, {srt_file}")
-    return True
+    logger.info(f"WhisperX transcription complete → {json_file}, {srt_file}")
+
+
+def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
+                                ws: dict,
+                                vad_filter: bool = False,
+                                config_keys: tuple[str, str] = ("transcription_json",
+                                                                  "transcription_srt")) -> None:
+    """Transcribe using faster-whisper (CTranslate2-accelerated Whisper).
+
+    vad_filter — pass --vad_filter to skip non-speech windows (ideal for FL+FR).
+    config_keys — (json_key, srt_key) to store output paths under in config.
+    """
+    model        = ws.get("model", "large-v3")
+    device       = ws.get("device", "cuda" if CUDA_AVAILABLE else "cpu")
+    compute_type = ws.get("compute_type", "float16" if CUDA_AVAILABLE else "int8")
+    language     = ws.get("language")    # None = auto-detect
+    beam_size    = ws.get("beam_size", 5)
+    batch_size   = ws.get("batch_size", 16)
+    max_seg_dur  = ws.get("max_segment_duration", 6.0)
+    script       = os.path.join(os.path.dirname(__file__), "faster_whisper_transcribe.py")
+
+    cmd = [
+        sys.executable, script,
+        input_path,
+        "--output_dir",            UPLOAD_FOLDER,
+        "--model",                 model,
+        "--device",                device,
+        "--compute_type",          compute_type,
+        "--beam_size",             str(beam_size),
+        "--batch_size",            str(batch_size),
+        "--max_segment_duration",  str(max_seg_dur),
+    ]
+    if language:
+        cmd += ["--language", language]
+    if vad_filter:
+        cmd += ["--vad_filter"]
+
+    step = "flr_transcribe" if config_keys[0] != "transcription_json" else "faster_whisper_transcribe"
+    _run(cmd, step=step)
+
+    base      = os.path.splitext(os.path.basename(input_file))[0]
+    json_file = f"{base}.json"
+    srt_file  = f"{base}.srt"
+    json_key, srt_key = config_keys
+    update_config(job_id, {
+        json_key:                json_file,
+        srt_key:                 srt_file,
+        "transcription_backend": "faster_whisper",
+    })
+    logger.info(f"faster-whisper transcription complete [{json_key}] → {json_file}, {srt_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -688,15 +812,40 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
     # punctuation (not just edges) so entries like "Christ's" or "face-fucks"
     # match the de-punctuated form whisperX produces ("christs", "facefucks").
     clean_profanity = {
-        "".join(c for c in w.lower() if c not in string.punctuation)
+        "".join(c for c in w.lower() if c not in string.punctuation).strip()
         for w in profanity
     }
     hits = []
     for segment in timestamps_data.get("segments", []):
         words = segment.get("words", [])
+
+        if not words:
+            # ----------------------------------------------------------------
+            # Fallback: no word-level timestamps for this segment.
+            # BatchedInferencePipeline sometimes returns segments with words=[].
+            # Check if the segment TEXT contains any profanity and cover the
+            # whole segment if so.
+            # ----------------------------------------------------------------
+            seg_text_clean = "".join(
+                c for c in segment.get("text", "").lower()
+                if c not in string.punctuation
+            )
+            for token in seg_text_clean.split():
+                if token in clean_profanity:
+                    logger.warning(
+                        f"Profanity '{token}' found in segment text but no word timestamps "
+                        f"({segment.get('start'):.2f}-{segment.get('end'):.2f}) — covering full segment."
+                    )
+                    hits.append({
+                        "start": max(0.0, float(segment["start"]) - pad_before),
+                        "end":   float(segment["end"]) + pad_after,
+                    })
+                    break  # one hit covers the whole segment; don't add duplicates
+            continue
+
         for i, word in enumerate(words):
             raw = word.get("word", "")
-            clean = "".join(c for c in raw.lower() if c not in string.punctuation)
+            clean = "".join(c for c in raw.lower() if c not in string.punctuation).strip()
             if clean in clean_profanity:
                 # Bug fix 1a: handle missing word-level timestamps (fast/overlapping speech).
                 # WhisperX sometimes omits start/end on individual words — fall back to
@@ -707,10 +856,6 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
                         f"{segment.get('start'):.2f}-{segment.get('end'):.2f} "
                         f"— using segment bounds as fallback."
                     )
-                    # Don't add pad_after to segment["end"] — the segment end
-                    # already includes natural duration and trailing silence.
-                    # Extra padding here would cause the bleep to spill well
-                    # beyond the actual word.
                     hits.append({
                         "start": max(0.0, float(segment["start"]) - pad_before),
                         "end":   float(segment["end"]),
@@ -988,16 +1133,19 @@ def redact_audio(job_id: str,
     update_config(job_id, {"redacted_srt": out_srt_file})
 
     if not profanity_ts:
-        # No profanity detected — use center channel as-is (no bleeping needed)
-        logger.info("No profanity detected – skipping bleep filter.")
+        # No profanity in FC — use center channel as-is
+        logger.info("No profanity detected in FC – skipping FC bleep filter.")
         if channels <= 2:
             update_config(job_id, {"redacted_audio_stream_final": center_file})
+            logger.info("Redaction complete (no profanity found).")
+            return "Redaction completed successfully (no profanity)"
         else:
             update_config(job_id, {"redacted_channel_FC": center_file})
-        logger.info("Redaction complete (no profanity found).")
-        return "Redaction completed successfully (no profanity)"
+            _redact_flr_pass(job_id, config, profanity, duration, bit_rate, sample_rate, codec, pad_before, pad_after)
+            logger.info("Redaction complete.")
+            return "Redaction completed successfully"
 
-    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)
+    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)  # noqa: F841
     filter_complex  = _build_ffmpeg_filter(profanity_ts, duration)
 
     # Apply bleep filter to center channel
@@ -1014,9 +1162,43 @@ def redact_audio(job_id: str,
             modified_center, bit_rate, sample_rate, codec, loudness
         )
         update_config(job_id, {"redacted_channel_FC": normalized_center})
+        _redact_flr_pass(job_id, config, profanity, duration, bit_rate, sample_rate, codec, pad_before, pad_after)
 
     logger.info("Redaction complete.")
     return "Redaction completed successfully"
+
+
+def _redact_flr_pass(job_id: str, config: dict, profanity: list[str],
+                     fc_duration: float, bit_rate, sample_rate, codec: str,
+                     pad_before: float, pad_after: float) -> None:
+    """Apply bleep filter to FL+FR stereo channel if FL+FR transcription exists."""
+    flr_json_filename = config.get("flr_transcription_json")
+    flr_file          = config.get("flr_channel_file")
+    if not (flr_json_filename and flr_file):
+        return
+
+    flr_json_path = os.path.join(UPLOAD_FOLDER, flr_json_filename)
+    flr_path      = os.path.join(UPLOAD_FOLDER, flr_file)
+    if not (os.path.exists(flr_json_path) and os.path.exists(flr_path)):
+        logger.warning("FL+FR transcription or audio file missing — skipping FL+FR redaction.")
+        return
+
+    with open(flr_json_path) as f:
+        flr_ts_data = json.load(f)
+
+    flr_profanity_ts = identify_profanity_timestamps(
+        flr_ts_data, profanity, pad_before=pad_before, pad_after=pad_after
+    )
+    if not flr_profanity_ts:
+        logger.info("FL+FR: no profanity detected — original FL+FR preserved.")
+        return
+
+    logger.info(f"FL+FR: {len(flr_profanity_ts)} profanity hit(s) — bleeping.")
+    flr_duration = flr_ts_data["segments"][-1]["end"] if flr_ts_data.get("segments") else fc_duration
+    flr_filter   = _build_ffmpeg_filter(flr_profanity_ts, flr_duration)
+    modified_flr = apply_complex_filter_to_audio(flr_path, flr_filter, bit_rate, sample_rate, codec)
+    update_config(job_id, {"redacted_channel_FLR": modified_flr})
+    logger.info(f"FL+FR redacted → {modified_flr}")
 
 
 # ---------------------------------------------------------------------------
@@ -1024,46 +1206,56 @@ def redact_audio(job_id: str,
 # Dynamically handles any channel layout – no more hardcoded 5.1(side).
 # ---------------------------------------------------------------------------
 
-def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: int) -> str:
+def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: int,
+                      flr_input_index: int | None = None) -> str:
     """
-    Build the pan filter to replace the FC channel in the final mix.
+    Build the ffmpeg filter_complex to replace FC (and optionally FL+FR) in the final mix.
 
-    Strategy:
-      - All channels come from the original audio (input original_input_index).
-      - The FC channel (c2 for most 5.1/7.1 layouts) is replaced by the
-        redacted mono center (input fc_input_index, channel c0).
+    With flr_input_index=None  (FC only):
+        amerge=inputs=2  → original(n ch) + fc_mono(1 ch)
+        pan replaces channel at FC position with the new mono
 
-    Returns an ffmpeg filter_complex string.
+    With flr_input_index set  (FC + FL+FR):
+        amerge=inputs=3  → original(n ch) + fc_mono(1 ch) + flr_stereo(2 ch)
+        pan replaces FC with c(n), FL with c(n+1), FR with c(n+2)
     """
-    channels = CHANNEL_LAYOUTS.get(layout)
-    if not channels:
-        # Fallback: just pass through the original audio unchanged
+    ch_list = CHANNEL_LAYOUTS.get(layout)
+    if not ch_list:
         logger.warning(f"Unknown layout {layout!r} – using passthrough.")
         return f"[{original_input_index}:a]acopy[final]"
 
-    n = len(channels)
+    n = len(ch_list)
 
-    if "FC" not in channels:
-        # No center channel – just pass through original audio
+    if "FC" not in ch_list:
         return f"[{original_input_index}:a]acopy[final]"
 
-    fc_idx = channels.index("FC")
-
-    # We use amerge + pan approach:
-    #   - input original_input_index: original audio (n channels)
-    #   - input fc_input_index: redacted center (1 channel = FC replacement)
-    # amerge gives us n+1 channels total; then pan selects correctly.
-    # Original channels occupy c0..c(n-1); redacted FC occupies c(n).
-    channel_map = "|".join(
-        f"c{i}=c{n + 0}" if ch == "FC" else f"c{i}=c{i}"
-        for i, ch in enumerate(channels)
-    )
-    filter_str = (
-        f"[{original_input_index}:a][{fc_input_index}:a]"
-        f"amerge=inputs=2[merged];"
-        f"[merged]pan={layout}|{channel_map}[final]"
-    )
-    return filter_str
+    if flr_input_index is not None and "FL" in ch_list and "FR" in ch_list:
+        # 3-input merge: original + fc_mono + flr_stereo
+        # Merged channel map: c0..c(n-1)=original, c(n)=fc_mono, c(n+1)=FL_red, c(n+2)=FR_red
+        channel_map = "|".join(
+            f"c{i}=c{n}"     if ch == "FC" else
+            f"c{i}=c{n+1}"   if ch == "FL" else
+            f"c{i}=c{n+2}"   if ch == "FR" else
+            f"c{i}=c{i}"
+            for i, ch in enumerate(ch_list)
+        )
+        return (
+            f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
+            f"[{flr_input_index}:a]aformat=channel_layouts=stereo[flr_stereo];"
+            f"[{original_input_index}:a][fc_mono][flr_stereo]amerge=inputs=3[merged];"
+            f"[merged]pan={layout}|{channel_map}[final]"
+        )
+    else:
+        # 2-input merge: original + fc_mono only
+        channel_map = "|".join(
+            f"c{i}=c{n}" if ch == "FC" else f"c{i}=c{i}"
+            for i, ch in enumerate(ch_list)
+        )
+        return (
+            f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
+            f"[{original_input_index}:a][fc_mono]amerge=inputs=2[merged];"
+            f"[merged]pan={layout}|{channel_map}[final]"
+        )
 
 
 def combine_media_file(job_id: str) -> str:
@@ -1085,6 +1277,10 @@ def combine_media_file(job_id: str) -> str:
     else:
         redacted_audio = config.get("redacted_channel_FC")
 
+    redacted_flr       = config.get("redacted_channel_FLR")   # None if no FL+FR swears
+    redacted_flr_path  = os.path.join(UPLOAD_FOLDER, redacted_flr) if redacted_flr else None
+    use_flr            = bool(redacted_flr_path and os.path.exists(redacted_flr_path))
+
     if not all([input_media_file, redacted_audio, redacted_srt]):
         raise ValueError("Missing input_filename, redacted_audio, or redacted_srt in config")
 
@@ -1104,7 +1300,7 @@ def combine_media_file(job_id: str) -> str:
         sub_streams   = [s for s in all_streams if s.get("codec_type") == "subtitle"]
         keep_sub_idxs = [i for i, s in enumerate(sub_streams)
                          if s.get("codec_name", "").lower() not in MOV_SUB_CODECS]
-        redacted_sub_idx = len(keep_sub_idxs)   # redacted SRT goes after kept subs
+        redacted_sub_idx = len(keep_sub_idxs)
     except Exception:
         sub_streams      = []
         keep_sub_idxs    = []
@@ -1137,6 +1333,10 @@ def combine_media_file(job_id: str) -> str:
         audio_path  = os.path.join(UPLOAD_FOLDER, audio_file) if audio_file else None
 
         if audio_path and os.path.exists(audio_path):
+            # Inputs: 0=MKV, 1=extracted audio, 2=redacted FC, [3=redacted FLR], N=SRT
+            extra_inputs  = ["-i", redacted_flr_path] if use_flr else []
+            srt_input_idx = 3 + int(use_flr)
+            flr_idx       = 3 if use_flr else None
             cmd = (
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
@@ -1144,15 +1344,18 @@ def combine_media_file(job_id: str) -> str:
                     "-i", input_media_path,              # 0: original MKV
                     "-i", audio_path,                    # 1: extracted audio
                     "-i", redacted_audio_path,           # 2: redacted FC
-                    "-i", redacted_srt_path,             # 3: redacted SRT
-                    "-filter_complex",
-                    _build_pan_filter(layout, fc_input_index=2, original_input_index=1),
-                    "-map", "0:v",
-                    "-map", "[final]",                   # family audio
-                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                ]
+                + extra_inputs
+                + ["-i", redacted_srt_path,
+                   "-filter_complex",
+                   _build_pan_filter(layout, fc_input_index=2, original_input_index=1,
+                                     flr_input_index=flr_idx),
+                   "-map", "0:v",
+                   "-map", "[final]",                    # family audio
+                   "-map", f"0:a:{orig_stream_idx}",     # original audio
                 ]
                 + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-                + ["-map", "3:s",                        # redacted SRT
+                + [f"-map", f"{srt_input_idx}:s",        # redacted SRT
                    "-c:v", "copy",
                    "-c:a:0", codec,
                 ]
@@ -1164,15 +1367,18 @@ def combine_media_file(job_id: str) -> str:
                 + [
                     "-i", input_media_path,              # 0: original MKV
                     "-i", redacted_audio_path,           # 1: redacted FC
-                    "-i", redacted_srt_path,             # 2: redacted SRT
-                    "-filter_complex",
-                    _build_pan_filter(layout, fc_input_index=1, original_input_index=0),
-                    "-map", "0:v",
-                    "-map", "[final]",                   # family audio
-                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                ]
+                + (["-i", redacted_flr_path] if use_flr else [])
+                + ["-i", redacted_srt_path,
+                   "-filter_complex",
+                   _build_pan_filter(layout, fc_input_index=1, original_input_index=0,
+                                     flr_input_index=2 if use_flr else None),
+                   "-map", "0:v",
+                   "-map", "[final]",                    # family audio
+                   "-map", f"0:a:{orig_stream_idx}",     # original audio
                 ]
                 + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-                + ["-map", "2:s",                        # redacted SRT
+                + ["-map", f"{2 + int(use_flr)}:s",      # redacted SRT
                    "-c:v", "copy",
                    "-c:a:0", codec,
                 ]
@@ -1182,8 +1388,15 @@ def combine_media_file(job_id: str) -> str:
     if sample_rate: cmd += ["-ar", str(sample_rate)]
 
     cmd += ["-c:a:1", "copy"]
-    cmd += ["-c:s", "copy"]                          # copy all kept subs as-is
-    cmd += [f"-c:s:{redacted_sub_idx}", "srt"]       # force srt for redacted track
+
+    # MP4/MOV containers only support mov_text subtitles — subrip/srt will error.
+    # MKV and others accept srt/copy directly.
+    mp4_container = os.path.splitext(output_path)[1].lower() in (".mp4", ".m4v", ".mov")
+    sub_codec_copy     = "mov_text" if mp4_container else "copy"
+    sub_codec_redacted = "mov_text" if mp4_container else "srt"
+
+    cmd += ["-c:s", sub_codec_copy]
+    cmd += [f"-c:s:{redacted_sub_idx}", sub_codec_redacted]
 
     cmd += [
         "-metadata:s:a:0", "title=Family audio",
@@ -1259,16 +1472,19 @@ def cleanup_job_files(job_id: str) -> str:
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
-        f"{job_id}_*",           # config + any job-tagged files
-        f"{base}_center*.*",
+        f"{job_id}_*",            # config + any job-tagged files
+        f"{base}*center*.*",      # center channel extractions (e.g. _norm_center.ac3)
+        f"{base}*flr*.*",         # FL+FR stereo extractions
         f"{base}_audio*.*",
         f"{base}_norm*.*",
         f"{base}_*redacted*.*",
         f"{base}_*normalized*.*",
         f"{base}_*final*.*",
-        f"{base}*.json",         # whisperX transcript
-        f"{base}*.srt",          # raw + redacted SRT
-        f"{base}*.ac3",          # normalized + extracted audio
+        f"{base}*.json",          # transcription JSON
+        f"{base}*.srt",           # raw + redacted SRT
+        f"{base}*.vtt",           # WebVTT subtitles
+        f"{base}*.txt",           # plain-text transcript
+        f"{base}*.ac3",           # normalized + extracted audio
         f"{base}*.dts",
         f"{base}*.aac",
         f"{base}*.flac",
@@ -1661,7 +1877,19 @@ def api_process_full():
     {
         "job_id":           "<existing job_id>",   // if omitted, a new job is created
         "filename":         "movie.mkv",           // required if no job_id pre-loaded
-        "whisperx_settings": { ... },
+        "whisperx_settings": {              // transcription settings
+            "backend":      "faster_whisper", // "faster_whisper" (default) | "whisperx"
+            // --- faster_whisper / whisperx shared ---
+            "model":        "large-v3",
+            "device":       "cuda",
+            "compute_type": "float16",        // float16 (GPU) or int8 (CPU)
+            "language":     "en",             // omit for auto-detect
+            // --- faster_whisper only ---
+            "beam_size": 5,
+            // --- whisperx only ---
+            // "align_model": "WAV2VEC2_ASR_LARGE_LV60K_960H",
+            // "batch_size":  20,
+        },
         "plex_url":         "http://plex:32400",
         "plex_token":       "abc123",
         "plex_section_id":  "1"

@@ -4,6 +4,12 @@ python-magic>=0.4.27
 requests>=2.31.0
 watchdog>=4.0.0
 gunicorn>=21.2.0
-torch>=2.2.0
-whisperx>=3.1.1
 
+# torch and torchaudio are managed explicitly in Dockerfile (CUDA builds).
+# Do NOT add them here.
+
+# Transcription backends (default: faster_whisper)
+faster-whisper>=1.0.0
+
+# Optional backends:
+# pip install whisperx>=3.1.1          # whisperx backend
