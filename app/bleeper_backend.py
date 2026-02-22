@@ -1993,6 +1993,18 @@ def api_process_full():
         plex_token        = data.get("plex_token")
         plex_section_id   = data.get("plex_section_id")
 
+        # Persist pipeline args so they survive a container restart + recovery
+        update_config(job_id, {
+            "pipeline_args": {
+                "whisperx_settings": whisperx_settings,
+                "pad_before":        pad_before,
+                "pad_after":         pad_after,
+                "plex_url":          plex_url,
+                "plex_token":        plex_token,
+                "plex_section_id":   plex_section_id,
+            }
+        })
+
         position = _queue_pipeline(
             job_id,
             run_full_pipeline,
@@ -2009,3 +2021,99 @@ def api_process_full():
 
     except Exception as e:
         return _error(str(e), 500, details=traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Section 14 – Startup recovery: re-queue interrupted jobs
+# ---------------------------------------------------------------------------
+
+_RECOVERY_MAX_RETRIES = 5
+
+def _recover_incomplete_jobs() -> None:
+    """
+    On startup, scan the uploads folder for any jobs that were interrupted
+    (container restart, crash, OOM, etc.) and re-queue them automatically.
+
+    - Jobs with status 'completed' are skipped.
+    - Jobs that have already been retried _RECOVERY_MAX_RETRIES times are
+      permanently abandoned (status → 'failed').
+    - retry_count is incremented only if the job had actually started
+      (status was 'running' or 'error'); a job that was merely 'queued'
+      when the container restarted doesn't consume a retry slot.
+    """
+    if not os.path.isdir(UPLOAD_FOLDER):
+        return
+
+    recovered = 0
+    abandoned = 0
+
+    for config_path in sorted(glob.glob(os.path.join(UPLOAD_FOLDER, "*_config.json"))):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        job_id      = config.get("job_id")
+        status      = config.get("pipeline_status", "")
+        retry_count = int(config.get("retry_count", 0))
+
+        if not job_id or status in ("completed",):
+            continue
+
+        # Jobs explicitly abandoned on a previous startup
+        if status == "failed" and retry_count >= _RECOVERY_MAX_RETRIES:
+            continue
+
+        if retry_count >= _RECOVERY_MAX_RETRIES:
+            logger.warning(
+                f"[recovery] Job {job_id} ({config.get('original_filename', '?')}) "
+                f"reached max retries ({_RECOVERY_MAX_RETRIES}) — abandoning."
+            )
+            update_config(job_id, {
+                "pipeline_status": "failed",
+                "error": f"Automatically abandoned after {_RECOVERY_MAX_RETRIES} restart retries.",
+            })
+            abandoned += 1
+            continue
+
+        # Only burn a retry slot if the job had actually started running
+        new_retry = retry_count + (1 if status in ("running", "error") else 0)
+
+        update_config(job_id, {
+            "pipeline_status": "queued",
+            "pipeline_stage":  "recovery",
+            "retry_count":     new_retry,
+        })
+
+        # Restore original pipeline args (stored by process_full on first submission)
+        args = config.get("pipeline_args") or {}
+        whisperx_settings = args.get("whisperx_settings")
+        pad_before        = float(args.get("pad_before", 0.10))
+        pad_after         = float(args.get("pad_after",  0.10))
+        plex_url          = args.get("plex_url")
+        plex_token        = args.get("plex_token")
+        plex_section_id   = args.get("plex_section_id")
+
+        _queue_pipeline(
+            job_id,
+            run_full_pipeline,
+            (job_id, whisperx_settings, pad_before, pad_after,
+             plex_url, plex_token, plex_section_id),
+        )
+
+        logger.info(
+            f"[recovery] Re-queued '{config.get('original_filename', '?')}' "
+            f"(job={job_id}, attempt {new_retry + 1}/{_RECOVERY_MAX_RETRIES}, was: {status})"
+        )
+        recovered += 1
+
+    if recovered or abandoned:
+        logger.info(
+            f"[recovery] Startup recovery complete — "
+            f"{recovered} re-queued, {abandoned} abandoned."
+        )
+
+
+# Run recovery after all functions are defined (at gunicorn import time)
+_recover_incomplete_jobs()
