@@ -685,14 +685,14 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
         raise FileNotFoundError(f"Center channel file not found: {input_path}")
 
     ws      = whisperx_settings or {}
-    backend = ws.get("backend", "faster_whisper")   # "faster_whisper" | "parakeet"
+    backend = ws.get("backend", "faster_whisper")   # "faster_whisper" | "whisperx"
 
-    if backend == "parakeet":
-        _transcribe_parakeet(job_id, input_path, input_file, ws)
-    else:
-        _transcribe_faster_whisper(job_id, input_path, input_file, ws)
+    _transcribe_faster_whisper(job_id, input_path, input_file, ws) \
+        if backend != "whisperx" \
+        else _transcribe_whisperx(job_id, input_path, input_file, ws)
 
-        # ---- FL+FR pass (faster-whisper only, with VAD) -------------------
+    # ---- FL+FR pass (faster-whisper only, with VAD) -----------------------
+    if backend != "whisperx":
         flr_file = config.get("flr_channel_file")
         if flr_file:
             flr_path = os.path.join(UPLOAD_FOLDER, flr_file)
@@ -706,7 +706,7 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
             else:
                 logger.warning(f"FL+FR file not found, skipping FL+FR transcription: {flr_path}")
 
-        return True
+    return True
 
 
 def _transcribe_whisperx(job_id: str, input_path: str, input_file: str,
@@ -741,31 +741,6 @@ def _transcribe_whisperx(job_id: str, input_path: str, input_file: str,
         "transcription_backend": "whisperx",
     })
     logger.info(f"WhisperX transcription complete → {json_file}, {srt_file}")
-
-
-def _transcribe_parakeet(job_id: str, input_path: str, input_file: str,
-                          ws: dict) -> None:
-    """Transcribe using NVIDIA Parakeet TDT via parakeet_transcribe.py."""
-    model  = ws.get("model", "nvidia/parakeet-tdt-0.6b-v3")
-    script = os.path.join(os.path.dirname(__file__), "parakeet_transcribe.py")
-
-    cmd = [
-        sys.executable, script,
-        input_path,
-        "--output_dir", UPLOAD_FOLDER,
-        "--model",      model,
-    ]
-    _run(cmd, step="parakeet_transcribe")
-
-    base      = os.path.splitext(input_file)[0]
-    json_file = f"{base}.json"
-    srt_file  = f"{base}.srt"
-    update_config(job_id, {
-        "transcription_json":    json_file,
-        "transcription_srt":     srt_file,
-        "transcription_backend": "parakeet",
-    })
-    logger.info(f"Parakeet transcription complete → {json_file}, {srt_file}")
 
 
 def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
@@ -1903,7 +1878,7 @@ def api_process_full():
         "job_id":           "<existing job_id>",   // if omitted, a new job is created
         "filename":         "movie.mkv",           // required if no job_id pre-loaded
         "whisperx_settings": {              // transcription settings
-            "backend":      "faster_whisper", // "faster_whisper" (default) | "whisperx" | "parakeet"
+            "backend":      "faster_whisper", // "faster_whisper" (default) | "whisperx"
             // --- faster_whisper / whisperx shared ---
             "model":        "large-v3",
             "device":       "cuda",
@@ -1914,8 +1889,6 @@ def api_process_full():
             // --- whisperx only ---
             // "align_model": "WAV2VEC2_ASR_LARGE_LV60K_960H",
             // "batch_size":  20,
-            // --- parakeet only (requires nemo_toolkit[asr]) ---
-            // "model": "nvidia/parakeet-tdt-0.6b-v3",
         },
         "plex_url":         "http://plex:32400",
         "plex_token":       "abc123",

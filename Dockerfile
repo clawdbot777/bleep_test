@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Bleeper – Automated Profanity Filter Pipeline
-# Base: NVIDIA CUDA 12.1 + Python 3.11 (GPU-accelerated Parakeet TDT / NeMo)
+# Base: NVIDIA CUDA 12.1 + Python 3.11 (GPU-accelerated faster-whisper)
 #
 # Build:
 #   docker build -t bleeper .
