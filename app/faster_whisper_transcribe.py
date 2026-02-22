@@ -8,7 +8,9 @@ Usage:
         [--model large-v3] \
         [--device cuda] \
         [--compute_type float16] \
-        [--language en]
+        [--language en] \
+        [--beam_size 5] \
+        [--batch_size 8]
 
 Accepts any audio format ffmpeg understands — no pre-conversion needed.
 """
@@ -49,8 +51,8 @@ def main() -> None:
     parser.add_argument("--compute_type", default="float16")
     parser.add_argument("--language",     default=None, help="Language code (e.g. en). None = auto-detect.")
     parser.add_argument("--beam_size",    type=int, default=5)
-    parser.add_argument("--batch_size",   type=int, default=16,
-                        help="Batched inference batch size (0 = disable batching).")
+    parser.add_argument("--batch_size",   type=int, default=1,
+                        help="Number of audio chunks processed in parallel.")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
@@ -69,36 +71,21 @@ def main() -> None:
     print(f"[faster-whisper] Loading {args.model} on {args.device} ({args.compute_type})", flush=True)
     model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
 
-    if args.batch_size > 0:
-        try:
-            from faster_whisper.transcribe import BatchedInferencePipeline
-            batched = BatchedInferencePipeline(model=model)
-            print(f"[faster-whisper] Transcribing (batched, batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
-            segments_iter, info = batched.transcribe(
-                args.audio,
-                word_timestamps=True,
-                language=args.language,
-                batch_size=args.batch_size,
-            )
-        except ImportError:
-            print("[faster-whisper] BatchedInferencePipeline unavailable, falling back to sequential.", flush=True)
-            args.batch_size = 0
-
-    if args.batch_size == 0:
-        print(f"[faster-whisper] Transcribing (sequential): {os.path.basename(args.audio)}", flush=True)
-        segments_iter, info = model.transcribe(
-            args.audio,
-            word_timestamps=True,
-            language=args.language,
-            beam_size=args.beam_size,
-        )
+    print(f"[faster-whisper] Transcribing (batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
+    segments_iter, info = model.transcribe(
+        args.audio,
+        word_timestamps=True,
+        language=args.language,
+        beam_size=args.beam_size,
+        batch_size=args.batch_size,
+    )
 
     print(f"[faster-whisper] Language: {info.language} ({info.language_probability:.0%})", flush=True)
 
     segments = []
     for seg in segments_iter:
         words = [
-            {"word": w.word, "start": round(w.start, 3), "end": round(w.end, 3)}
+            {"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)}
             for w in (seg.words or [])
         ]
         segments.append({
