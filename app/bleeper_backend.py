@@ -815,6 +815,31 @@ def _load_profanity_list() -> list[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def _clean_token(token: str) -> str:
+    """Strip punctuation from a transcribed word but keep internal apostrophes.
+
+    Internal apostrophes indicate contractions (he'll, it's, can't) that must
+    not be collapsed into a different word.  Leading/trailing apostrophes and
+    all other punctuation are removed.
+
+    Examples:
+        "he'll"  → "he'll"   (NOT "hell")
+        "hell."  → "hell"
+        "f**k"   → "fk"      (transcriptions never produce this anyway)
+        "damn,"  → "damn"
+    """
+    token = token.lower()
+    result = []
+    for i, c in enumerate(token):
+        if c == "'":
+            # Keep only if truly flanked by letters (real contraction)
+            if 0 < i < len(token) - 1 and token[i - 1].isalpha() and token[i + 1].isalpha():
+                result.append(c)
+        elif c not in string.punctuation:
+            result.append(c)
+    return "".join(result).strip()
+
+
 def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
                                    pad_before: float = 0.10,
                                    pad_after:  float = 0.10) -> list[dict]:
@@ -837,12 +862,9 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
             # Check if the segment TEXT contains any profanity and cover the
             # whole segment if so.
             # ----------------------------------------------------------------
-            seg_text_clean = "".join(
-                c for c in segment.get("text", "").lower()
-                if c not in string.punctuation
-            )
+            seg_text_clean = segment.get("text", "").lower()
             for token in seg_text_clean.split():
-                if token in clean_profanity:
+                if _clean_token(token) in clean_profanity:
                     logger.warning(
                         f"Profanity '{token}' found in segment text but no word timestamps "
                         f"({segment.get('start'):.2f}-{segment.get('end'):.2f}) — covering full segment."
@@ -856,7 +878,7 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
 
         for i, word in enumerate(words):
             raw = word.get("word", "")
-            clean = "".join(c for c in raw.lower() if c not in string.punctuation).strip()
+            clean = _clean_token(raw)
             if clean in clean_profanity:
                 # Bug fix 1a: handle missing word-level timestamps (fast/overlapping speech).
                 # WhisperX sometimes omits start/end on individual words — fall back to
