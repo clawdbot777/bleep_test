@@ -10,7 +10,8 @@ Usage:
         [--compute_type float16] \
         [--language en] \
         [--beam_size 5] \
-        [--batch_size 8]
+        [--batch_size 16] \
+        [--max_segment_duration 6]
 
 Accepts any audio format ffmpeg understands — no pre-conversion needed.
 """
@@ -19,6 +20,9 @@ import argparse
 import json
 import os
 import sys
+
+# Characters that mark a natural sentence end — split here when a segment is too long.
+_SENTENCE_END = frozenset(".!?")
 
 
 def _to_srt_time(s: float) -> str:
@@ -40,6 +44,57 @@ def _build_srt(segments: list[dict]) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
+def _split_long_segments(segments: list[dict], max_duration: float) -> list[dict]:
+    """
+    Split segments that exceed max_duration seconds into shorter ones.
+
+    Strategy:
+      1. Walk the segment's words.
+      2. Whenever we hit a sentence-ending word (ends with . ! ?) AND the
+         current chunk has been running for >= 1 s, flush a new segment.
+      3. If no sentence boundary exists within max_duration, force-split at
+         the nearest word boundary after max_duration.
+
+    Word-level timestamps are preserved; each child segment gets the exact
+    start/end of its first/last word.
+    """
+    out = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        words    = seg.get("words", [])
+
+        # Short enough or no word timestamps — keep as-is.
+        if duration <= max_duration or not words:
+            out.append(seg)
+            continue
+
+        chunk_words: list[dict] = []
+        chunk_start: float      = words[0]["start"]
+
+        for i, w in enumerate(words):
+            chunk_words.append(w)
+            chunk_duration = w["end"] - chunk_start
+            is_last        = (i == len(words) - 1)
+            at_sentence    = w["word"].rstrip().endswith(tuple(_SENTENCE_END))
+            over_limit     = chunk_duration >= max_duration
+
+            # Flush on: sentence end (if chunk > 1 s), forced split, or last word.
+            if (at_sentence and chunk_duration >= 1.0) or over_limit or is_last:
+                text = " ".join(cw["word"] for cw in chunk_words).strip()
+                if text:
+                    out.append({
+                        "start": round(chunk_start, 3),
+                        "end":   round(chunk_words[-1]["end"], 3),
+                        "text":  text,
+                        "words": chunk_words,
+                    })
+                chunk_words = []
+                if not is_last:
+                    chunk_start = words[i + 1]["start"]
+
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Transcribe audio with faster-whisper, write WhisperX-compatible JSON + SRT."
@@ -50,9 +105,11 @@ def main() -> None:
     parser.add_argument("--device",       default="cuda")
     parser.add_argument("--compute_type", default="float16")
     parser.add_argument("--language",     default=None, help="Language code (e.g. en). None = auto-detect.")
-    parser.add_argument("--beam_size",    type=int, default=5)
-    parser.add_argument("--batch_size",   type=int, default=16,
+    parser.add_argument("--beam_size",    type=int,   default=5)
+    parser.add_argument("--batch_size",   type=int,   default=16,
                         help="Number of audio chunks processed in parallel.")
+    parser.add_argument("--max_segment_duration", type=float, default=6.0,
+                        help="Split segments longer than this many seconds (default 6).")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
@@ -105,6 +162,12 @@ def main() -> None:
             "words": words,
         })
 
+    before = len(segments)
+    segments = _split_long_segments(segments, args.max_segment_duration)
+    after   = len(segments)
+    if after > before:
+        print(f"[faster-whisper] Segment split: {before} → {after} segments (max {args.max_segment_duration}s)", flush=True)
+
     whisperx_json = {"segments": segments}
 
     base      = os.path.splitext(os.path.basename(args.audio))[0]
@@ -117,7 +180,7 @@ def main() -> None:
     with open(srt_path, "w", encoding="utf-8") as fh:
         fh.write(_build_srt(segments))
 
-    print(f"[faster-whisper] Done — {len(segments)} segments")
+    print(f"[faster-whisper] Done — {after} segments")
     print(f"[faster-whisper] JSON → {json_path}")
     print(f"[faster-whisper] SRT  → {srt_path}")
 

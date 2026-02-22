@@ -719,17 +719,19 @@ def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
     language     = ws.get("language")    # None = auto-detect
     beam_size    = ws.get("beam_size", 5)
     batch_size   = ws.get("batch_size", 16)
+    max_seg_dur  = ws.get("max_segment_duration", 6.0)
     script       = os.path.join(os.path.dirname(__file__), "faster_whisper_transcribe.py")
 
     cmd = [
         sys.executable, script,
         input_path,
-        "--output_dir",   UPLOAD_FOLDER,
-        "--model",        model,
-        "--device",       device,
-        "--compute_type", compute_type,
-        "--beam_size",    str(beam_size),
-        "--batch_size",   str(batch_size),
+        "--output_dir",            UPLOAD_FOLDER,
+        "--model",                 model,
+        "--device",                device,
+        "--compute_type",          compute_type,
+        "--beam_size",             str(beam_size),
+        "--batch_size",            str(batch_size),
+        "--max_segment_duration",  str(max_seg_dur),
     ]
     if language:
         cmd += ["--language", language]
