@@ -1482,24 +1482,25 @@ def cleanup_job_files(job_id: str) -> str:
             raise
 
     base = os.path.splitext(input_filename)[0]
+    base_esc = glob.escape(base)   # neutralise [ ] { } * ? in arr-style filenames
     patterns = [
-        f"{job_id}_*",            # config + any job-tagged files
-        f"{base}*center*.*",      # center channel extractions (e.g. _norm_center.ac3)
-        f"{base}*flr*.*",         # FL+FR stereo extractions
-        f"{base}_audio*.*",
-        f"{base}_norm*.*",
-        f"{base}_*redacted*.*",
-        f"{base}_*normalized*.*",
-        f"{base}_*final*.*",
-        f"{base}*.json",          # transcription JSON
-        f"{base}*.srt",           # raw + redacted SRT
-        f"{base}*.vtt",           # WebVTT subtitles
-        f"{base}*.txt",           # plain-text transcript
-        f"{base}*.ac3",           # normalized + extracted audio
-        f"{base}*.dts",
-        f"{base}*.aac",
-        f"{base}*.flac",
-        f"{base}*.wav",
+        f"{glob.escape(job_id)}_*",   # config + any job-tagged files (incl. .tmp atomics)
+        f"{base_esc}*center*.*",      # center channel extractions (e.g. _norm_center.ac3)
+        f"{base_esc}*flr*.*",         # FL+FR stereo extractions
+        f"{base_esc}_audio*.*",
+        f"{base_esc}_norm*.*",
+        f"{base_esc}_*redacted*.*",
+        f"{base_esc}_*normalized*.*",
+        f"{base_esc}_*final*.*",
+        f"{base_esc}*.json",          # transcription JSON
+        f"{base_esc}*.srt",           # raw + redacted SRT
+        f"{base_esc}*.vtt",           # WebVTT subtitles
+        f"{base_esc}*.txt",           # plain-text transcript
+        f"{base_esc}*.ac3",           # normalized + extracted audio
+        f"{base_esc}*.dts",
+        f"{base_esc}*.aac",
+        f"{base_esc}*.flac",
+        f"{base_esc}*.wav",
     ]
     removed = []
     for pattern in patterns:
