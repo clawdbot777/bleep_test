@@ -49,6 +49,8 @@ def main() -> None:
     parser.add_argument("--compute_type", default="float16")
     parser.add_argument("--language",     default=None, help="Language code (e.g. en). None = auto-detect.")
     parser.add_argument("--beam_size",    type=int, default=5)
+    parser.add_argument("--batch_size",   type=int, default=16,
+                        help="Batched inference batch size (0 = disable batching).")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
@@ -67,13 +69,29 @@ def main() -> None:
     print(f"[faster-whisper] Loading {args.model} on {args.device} ({args.compute_type})", flush=True)
     model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
 
-    print(f"[faster-whisper] Transcribing: {os.path.basename(args.audio)}", flush=True)
-    segments_iter, info = model.transcribe(
-        args.audio,
-        word_timestamps=True,
-        language=args.language,
-        beam_size=args.beam_size,
-    )
+    if args.batch_size > 0:
+        try:
+            from faster_whisper.transcribe import BatchedInferencePipeline
+            batched = BatchedInferencePipeline(model=model)
+            print(f"[faster-whisper] Transcribing (batched, batch_size={args.batch_size}): {os.path.basename(args.audio)}", flush=True)
+            segments_iter, info = batched.transcribe(
+                args.audio,
+                word_timestamps=True,
+                language=args.language,
+                batch_size=args.batch_size,
+            )
+        except ImportError:
+            print("[faster-whisper] BatchedInferencePipeline unavailable, falling back to sequential.", flush=True)
+            args.batch_size = 0
+
+    if args.batch_size == 0:
+        print(f"[faster-whisper] Transcribing (sequential): {os.path.basename(args.audio)}", flush=True)
+        segments_iter, info = model.transcribe(
+            args.audio,
+            word_timestamps=True,
+            language=args.language,
+            beam_size=args.beam_size,
+        )
 
     print(f"[faster-whisper] Language: {info.language} ({info.language_probability:.0%})", flush=True)
 

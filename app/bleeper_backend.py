@@ -718,6 +718,7 @@ def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
     compute_type = ws.get("compute_type", "float16" if CUDA_AVAILABLE else "int8")
     language     = ws.get("language")    # None = auto-detect
     beam_size    = ws.get("beam_size", 5)
+    batch_size   = ws.get("batch_size", 16)  # 0 = disable batching
     script       = os.path.join(os.path.dirname(__file__), "faster_whisper_transcribe.py")
 
     cmd = [
@@ -728,6 +729,7 @@ def _transcribe_faster_whisper(job_id: str, input_path: str, input_file: str,
         "--device",       device,
         "--compute_type", compute_type,
         "--beam_size",    str(beam_size),
+        "--batch_size",   str(batch_size),
     ]
     if language:
         cmd += ["--language", language]
