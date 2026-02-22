@@ -766,7 +766,7 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
     # punctuation (not just edges) so entries like "Christ's" or "face-fucks"
     # match the de-punctuated form whisperX produces ("christs", "facefucks").
     clean_profanity = {
-        "".join(c for c in w.lower() if c not in string.punctuation)
+        "".join(c for c in w.lower() if c not in string.punctuation).strip()
         for w in profanity
     }
     hits = []
@@ -774,7 +774,7 @@ def identify_profanity_timestamps(timestamps_data: dict, profanity: list[str],
         words = segment.get("words", [])
         for i, word in enumerate(words):
             raw = word.get("word", "")
-            clean = "".join(c for c in raw.lower() if c not in string.punctuation)
+            clean = "".join(c for c in raw.lower() if c not in string.punctuation).strip()
             if clean in clean_profanity:
                 # Bug fix 1a: handle missing word-level timestamps (fast/overlapping speech).
                 # WhisperX sometimes omits start/end on individual words — fall back to
