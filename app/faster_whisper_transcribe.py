@@ -110,6 +110,8 @@ def main() -> None:
                         help="Number of audio chunks processed in parallel.")
     parser.add_argument("--max_segment_duration", type=float, default=6.0,
                         help="Split segments longer than this many seconds (default 6).")
+    parser.add_argument("--vad_filter",   action="store_true",
+                        help="Use Silero VAD to skip non-speech audio (recommended for sparse-dialogue tracks).")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
@@ -139,12 +141,13 @@ def main() -> None:
             batch_size=args.batch_size,
         )
     else:
-        print(f"[faster-whisper] Transcribing (sequential): {os.path.basename(args.audio)}", flush=True)
+        print(f"[faster-whisper] Transcribing (sequential, vad={args.vad_filter}): {os.path.basename(args.audio)}", flush=True)
         segments_iter, info = model.transcribe(
             args.audio,
             word_timestamps=True,
             language=args.language,
             beam_size=args.beam_size,
+            vad_filter=args.vad_filter,
         )
 
     print(f"[faster-whisper] Language: {info.language} ({info.language_probability:.0%})", flush=True)
