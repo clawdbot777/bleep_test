@@ -1996,7 +1996,6 @@ def api_process_full():
         # Persist pipeline args so they survive a container restart + recovery
         update_config(job_id, {
             "pipeline_args": {
-                "whisperx_settings": whisperx_settings,
                 "pad_before":        pad_before,
                 "pad_after":         pad_after,
                 "plex_url":          plex_url,
@@ -2088,7 +2087,6 @@ def _recover_incomplete_jobs() -> None:
 
         # Restore original pipeline args (stored by process_full on first submission)
         args = config.get("pipeline_args") or {}
-        whisperx_settings = args.get("whisperx_settings")
         pad_before        = float(args.get("pad_before", 0.10))
         pad_after         = float(args.get("pad_after",  0.10))
         plex_url          = args.get("plex_url")
@@ -2098,7 +2096,7 @@ def _recover_incomplete_jobs() -> None:
         _queue_pipeline(
             job_id,
             run_full_pipeline,
-            (job_id, whisperx_settings, pad_before, pad_after,
+            (job_id, None, pad_before, pad_after,
              plex_url, plex_token, plex_section_id),
         )
 
